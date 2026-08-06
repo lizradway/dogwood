@@ -1,0 +1,25 @@
+// The correlated-driver member of the 0919 family: a DRIVER predicate joined
+// on the anchor-shared var takes a different evaluation path than the
+// standalone read, one where the same-step guard check is keyed by the
+// DRIVER's value rather than the anchor row's.
+//
+// With a single event per step the driver pins `x` to the current event's
+// server, so the foreign-mismatch trap of 0919 cannot fire here — this case
+// is the OVER-CONSTRAINT control for that path: a MATCHING same-step
+// heartbeat (@10, streak seeded at the same step) must still PERMIT once the
+// guard check is keyed. @20 pins the no-anchor deny for a foreign server.
+//
+// Expected verdicts are in expected_1.out.
+permit (
+    principal,
+    action == Drupe::Action::"Heartbeat",
+    resource
+)
+when temporal {
+    exists (x: String). (
+        Drupe::Action::"Heartbeat"::request{ input.server: x }
+        && (Drupe::Action::"Heartbeat"::request{ input.server: x }
+            since within 1h
+            Drupe::Action::"Login"::request{ input.server: x })
+    )
+};

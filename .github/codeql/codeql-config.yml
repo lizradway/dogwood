@@ -1,0 +1,8 @@
+name: "CodeQL config"
+
+# This repository contains Rust code only — skip JavaScript/TypeScript/Ruby scanning.
+paths-ignore:
+  - 'dogwood-docs/**'
+  - 'book/**'
+  - '**/*.js'
+  - '**/*.ts'

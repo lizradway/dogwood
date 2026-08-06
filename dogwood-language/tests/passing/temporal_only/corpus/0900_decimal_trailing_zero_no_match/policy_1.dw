@@ -1,0 +1,14 @@
+// Permit Read when a Scan returned score decimal("0.50") within 1h.
+//
+// The policy pins `output.score: decimal("0.50")` while the trace carries
+// `score: 0.5`. Those are the same value written two ways, so the predicate
+// must compare decimals by numeric value rather than by their serialized
+// text. Expected: the Read at @2 permits.
+permit (
+    principal,
+    action == Drupe::Action::"Read",
+    resource
+)
+when temporal {
+    formerly within 1h (Drupe::Action::"Scan"::response{ input.user: context.input.user, output.score: decimal("0.50") })
+};

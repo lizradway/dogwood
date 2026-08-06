@@ -1,0 +1,55 @@
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dogwood-docs/guide/**'
+      - 'dogwood-docs/examples/**'
+      - 'dogwood-docs/mdbook-src/**'
+      - 'book.toml'
+      - 'generate-examples.sh'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: 'latest'
+
+      - name: Generate example pages
+        run: ./generate-examples.sh
+
+      - name: Fix links for mdBook
+        run: |
+          # README.md is served as root index.html but lives in guide/ —
+          # rewrite bare guide links to include the guide/ prefix
+          sed -i 's|\](\([0-9][0-9]-[a-z_-]*\.md\))|](./guide/\1)|g' dogwood-docs/guide/README.md
+          # Fix examples/ directory link to point to the generated index
+          sed -i 's|\](\.\.\/examples\/)|](./examples/index.md)|g' dogwood-docs/guide/README.md
+          # Convert directory-style example links to .md links across guide
+          find dogwood-docs/guide -name "*.md" ! -name "README.md" -exec sed -i 's|](\.\.\/examples\/\([a-z_]*\)\/)|](../examples/\1.md)|g' {} +
+
+      - name: Build with mdBook
+        run: mdbook build
+
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./book
+          publish_branch: gh-pages

@@ -1,0 +1,2 @@
+The test cases in `corpus_fuzz` are drawn from the `cedar-integration-tests` component of Cedar
+and are Copyright Cedar Contributors, licensed under Apache 2.0 license.

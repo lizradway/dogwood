@@ -1,0 +1,19 @@
+// Rejection case (decimal summand): the aggregation summand must be a `Long`.
+// Here `sum s` adds together `s`, bound to the decimal field `input.score`.
+// Dogwood arithmetic operates only on `Long` values, not decimals — matching
+// Cedar, whose +, -, * operate only on Long and offer no decimal arithmetic.
+// Leaving a decimal summand unchecked is therefore unsafe: there is no defined
+// meaning for summing decimals, so different implementations could reasonably
+// choose different behavior.
+//
+// The summand's type was never checked, so this validated cleanly. It should
+// be rejected by the temporal type-checker.
+//
+// Expected: rejected at `validate`.
+permit (principal, action == Drupe::Action::"Read", resource)
+when temporal {
+    exists (n: Long). (
+        (sum s for (s: decimal). where (Drupe::Action::"Charge"::request{ input.score: s })) == n
+        && n > 0
+    )
+};

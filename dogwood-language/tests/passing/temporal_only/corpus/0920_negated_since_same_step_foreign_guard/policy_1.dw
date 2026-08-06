@@ -1,0 +1,28 @@
+// The negated-polarity sibling of 0919: `without ... since` with an
+// ANCHOR-SHARED correlation var, at the same-step guard window.
+//
+// `!Heartbeat{server: x} since Login{server: x}` holds for a server that has
+// been SILENT since its login. A negated `since` must reject an anchor when
+// the guard fires at the current step — but if that same-step check tests only
+// the guard's predicate SHAPE, a heartbeat from a DIFFERENT server wrongly
+// rejects s1's silence → wrong DENY. That is the opposite error direction from
+// 0919, which together pin that the check must be keyed rather than weakened
+// or strengthened globally.
+//
+// @10 is the trap: s2's heartbeat must NOT count against s1's binding →
+// permit. @20 is the control: s1's OWN heartbeat must reject s1 → deny.
+// @30 pins the streak-history deny (s1 broke at @20; s2 has no anchor).
+//
+// Expected verdicts are in expected_1.out.
+permit (
+    principal,
+    action == Drupe::Action::"Heartbeat",
+    resource
+)
+when temporal {
+    exists (x: String). (
+        !Drupe::Action::"Heartbeat"::request{ input.server: x }
+        since within 1h
+        Drupe::Action::"Login"::request{ input.server: x }
+    )
+};
