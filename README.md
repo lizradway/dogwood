@@ -1,10 +1,9 @@
 # Dogwood
 
-Dogwood is a policy language for authorization decisions that depend on
-**history** — not just a single request, but patterns of events over time. It
+Dogwood is a governance language designed for AI agents and their tools. It
 supports [Cedar](https://www.cedarpolicy.com/) policies and adds temporal
-conditions (`since`, `formerly`, `once`, aggregations) and information providers
-(computed guardrail facts), then lowers everything back to Cedar for evaluation.
+conditions (`since`, `formerly`, `once`, aggregations) to look back over an
+agent's recent events.
 
 ```text
 permit(principal, action, resource)
