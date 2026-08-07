@@ -309,7 +309,6 @@ pub struct SchemaCheckReport {
 /// eager parser (which type-checks the schema and reports warnings) — unlike
 /// `PolicySchema::from_cedarschema_str`, which defers all checking to lowering.
 pub fn check_action_schema(source: &str) -> Result<SchemaCheckReport, OpError> {
-    let source = source.strip_prefix('\u{FEFF}').unwrap_or(source);
     match cedar::Schema::from_cedarschema_str(source) {
         Ok((_schema, warnings)) => Ok(SchemaCheckReport {
             kind: "action".to_string(),
