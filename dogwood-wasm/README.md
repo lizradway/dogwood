@@ -168,7 +168,7 @@ instance for as long as the history should live.
 
 An event is checked before it is observed, so a rejected event is a **no-op** —
 it leaves the temporal history untouched and the instance decides normally on the
-next call. Three things are rejected, each of which the engine alone would accept
+next call. Four things are rejected, each of which the engine alone would accept
 and then answer wrongly in a way no caller could detect:
 
 | Rejected | Why not just let it through |
@@ -176,6 +176,13 @@ and then answer wrongly in a way no caller could detect:
 | an action the schema does not declare | a bare `"Read"` parses but resolves to nothing, so it `deny`s with an **empty** `errors` — indistinguishable from "policy said no". The error suggests the qualified id. |
 | a `kind` the event schema does not declare | an undeclared kind is treated as history-only, so a typo (`"requst"`) returns `undefined` **forever** and nothing is ever authorized. |
 | a timestamp earlier than the previous event's | timestamps order events for the temporal operators; going backwards does not fail, it silently produces wrong answers. Equal timestamps are fine — two events can share a second. |
+| an action id containing an interior `::` | Cedar permits it, but `Event::builder` recovers the id by splitting on the *last* `::`, so `Drupe::Action::Read::Extra` resolves to nothing. Same empty-`errors` deny; same grounds for rejecting. |
+
+**These checks apply to the live authorizer only.** `replay` drives the
+frontend's own `.log` parser, whose parsed events are not inspectable from outside
+the crate, so a bare action id or an out-of-order trace still passes through it
+unremarked — see [Limitations](#notes--limitations). Two tests pin that asymmetry
+rather than leaving it to be discovered.
 
 Four getters describe what a given instance will accept, so a host can check its
 own wiring once at startup rather than discovering a gap one denied request at a
@@ -330,7 +337,7 @@ Three non-obvious things are needed to make the Cedar dependency tree compile to
 
 ## Testing
 
-`npm run verify` runs three suites (85 assertions) and the `--strict`
+`npm run verify` runs three suites (89 assertions) and the `--strict`
 type-check. All pass against `dogwood-language` at the commit this was written
 for.
 
@@ -338,7 +345,7 @@ for.
 |---|---|
 | `test.cjs` (9) | smoke: does each batch operation work at all? |
 | `test-live.cjs` (17) | do the live authorizer's *semantics* match `replay`? |
-| `test-coverage.cjs` (59) | is any part of the binding surface unexercised? |
+| `test-coverage.cjs` (63) | is any part of the binding surface unexercised? |
 
 The third is organised by API surface rather than by scenario, and covers every
 exported function, every field of every report, every optional argument, every
@@ -428,5 +435,20 @@ not just a rejected call — it can be a permanently broken object.
 - One `DogwoodAuthorizer` is one temporal history. It is not thread-safe and
   holds state, so do not share an instance across unrelated principals if your
   event schema is unpinned — and remember to `free()` it (see above).
+- **The temporal history is never pruned.** `max_window` bounds the *semantics*
+  (a 24h-old event cannot satisfy `formerly within 1h`) but not the *memory*:
+  measured growth is linear at ~1.6 KB per event with no plateau, so 40k events
+  cost ~64 MB whether or not any of them can still affect a decision. A
+  long-lived gateway must therefore `reset()` (or recreate) periodically,
+  accepting the loss of in-window history, or cap the instance's lifetime.
+  Fixing it properly means pruning outside `max_window` inside the engine — an
+  upstream change, not one these bindings can make. A test records the current
+  behaviour and will fail if upstream starts pruning.
+- **The event checks are on the live path only.** `replay` takes a whole `.log`
+  trace through the frontend's parser, and the parsed events are `pub(crate)`, so
+  there is nothing to validate from out here: a trace naming a bare action id
+  still denies with an empty `errors`, and one whose timestamps go backwards is
+  replayed as given. Tests pin both. Closing the gap needs either an inspectable
+  parsed-event type or the checks moved into `parse_trace`, upstream.
 - A Rust panic surfaces as a readable `console.error` (a panic hook is installed
   on module load).

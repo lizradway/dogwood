@@ -705,6 +705,44 @@ check("actions lists every schema action, including ones no policy names", () =>
   }
 });
 
+// Cedar permits an action id containing `::`; `Event::builder` recovers the id by
+// splitting on the LAST `::`, so such an action cannot be addressed at all — it
+// used to deny with an empty `errors`, the same indistinguishable-from-policy
+// failure a bare id gave. Rejected on the same grounds.
+check("an action id containing `::` is rejected, not silently un-addressable", () => {
+  const INNER = `namespace Drupe {
+  entity Gateway;
+  entity OAuthUser = { id: String } tags String;
+  type ReadInput = { document: String };
+  type ReadOutput = { content: String };
+  action "Read::Extra" appliesTo {
+    principal: [OAuthUser], resource: [Gateway],
+    context: { input: ReadInput, output: ReadOutput }
+  };
+}`;
+  const auth = new dw.DogwoodAuthorizer(
+    `permit(principal, action == Drupe::Action::"Read::Extra", resource);`,
+    INNER,
+  );
+  try {
+    // It IS in the schema, so `actions` lists it — the rejection is about the
+    // builder's addressing limit, not about the action being unknown.
+    assert(
+      JSON.stringify(auth.actions) === JSON.stringify(["Drupe::Action::Read::Extra"]),
+      "listed in actions, got " + JSON.stringify(auth.actions),
+    );
+    const e = throws(
+      () => auth.isAuthorized(event(1, { action: "Drupe::Action::Read::Extra" })),
+      "an un-addressable action must not look like a decision",
+    );
+    assert(e.name === "DogwoodError", "name, got " + e.name);
+    assert(/not supported|last `::`/.test(e.message), "explains why, got " + e.message);
+    assert(!/unknown action/.test(e.message), "and does NOT claim it is unknown");
+  } finally {
+    auth.free();
+  }
+});
+
 // A schema with no namespace derives `Action::Read`. Pinned because the guard
 // builds the qualified id itself, and getting that wrong would reject every
 // event under an unnamespaced schema — a false rejection, the failure mode a
@@ -1065,6 +1103,73 @@ check("lastTimestamp is a number, comparable with a decision's timestamp", () =>
     assert(typeof auth.lastTimestamp === "number", "got " + typeof auth.lastTimestamp);
     assert(auth.lastTimestamp === d.timestamp, "strictly equal to the decision's timestamp");
     assert(auth.lastTimestamp - 34 === 1200, "and usable in arithmetic");
+  } finally {
+    auth.free();
+  }
+});
+
+// ═══ 10. limitations the bindings do NOT close ═══════════════════════
+//
+// The live authorizer validates events; `replay` does not, because it drives the
+// frontend's own `.log` parser and the parsed events are not inspectable from
+// outside the crate. So the same mistake is caught on one path and not the other.
+// Asserted rather than merely written down, so that if upstream ever tightens the
+// trace path these tests fail and the README stops being wrong.
+console.log("\nknown limitations (recorded, not endorsed)");
+
+check("LIMITATION: replay does not reject a bare action id — it denies silently", () => {
+  const bare =
+    `@1 scope(principal: Drupe::OAuthUser::"alice", resource: Drupe::Gateway::"gw1") ` +
+    `request_context(input: { document: "d" }) ` +
+    `Action::"Read"::request(callerPrincipal: Drupe::OAuthUser::"alice", input: { document: "d" })`;
+  const r = dw.replay(ALLOW_ALL, SCHEMA, bare);
+  assert(r.verdicts.length === 1, "the trace still produces a verdict");
+  assert(r.verdicts[0].verdict === "deny", "and it denies, got " + r.verdicts[0].verdict);
+  assert(
+    r.verdicts[0].errors.length === 0,
+    "with NO stated cause — the live authorizer rejects this, replay does not",
+  );
+});
+
+check("LIMITATION: replay accepts a backwards timestamp in a trace", () => {
+  const line = (ts) =>
+    `@${ts} scope(principal: Drupe::OAuthUser::"alice", resource: Drupe::Gateway::"gw1") ` +
+    `request_context(input: { document: "d" }) ` +
+    `Drupe::Action::"Read"::request(callerPrincipal: Drupe::OAuthUser::"alice", input: { document: "d" })`;
+  const r = dw.replay(ALLOW_ALL, SCHEMA, `${line(100)}\n${line(50)}`);
+  assert(r.verdicts.length === 2, "both events replay");
+  assert(
+    r.verdicts[0].timestamp === 100 && r.verdicts[1].timestamp === 50,
+    "out of order, unremarked — the ordering contract is enforced only on the live path",
+  );
+});
+
+check("LIMITATION: temporal history is never pruned, so a long-lived instance grows", () => {
+  const TEMPORAL = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { formerly within 1h Drupe::Action::"Read"::response{} };`;
+  const auth = new dw.DogwoodAuthorizer(TEMPORAL, SCHEMA);
+  const response = (ts) =>
+    event(ts, {
+      kind: "response",
+      logged: { input: { document: "d" }, output: { content: "c" } },
+      context: { input: { document: "d" }, output: { content: "c" } },
+    });
+  try {
+    const before = process.memoryUsage().external;
+    // 4000 events 100s apart span ~4.6 days — every one of them far outside the
+    // default 24h `max_window`, so none can affect any future decision.
+    for (let i = 1; i <= 4000; i++) auth.isAuthorized(response(i * 100));
+    const grew = process.memoryUsage().external - before;
+    assert(
+      grew > 1e6,
+      "recording the CURRENT behaviour: memory grows with event count regardless " +
+        "of max_window (got " + (grew / 1e6).toFixed(1) + " MB). If this ever fails, " +
+        "upstream has started pruning and the README's note should be removed.",
+    );
+    // The window still bounds the SEMANTICS, even though it does not bound memory:
+    // a response 4.6 days old cannot satisfy `formerly within 1h`.
+    const d = auth.isAuthorized(event(4000 * 100 + 86400));
+    assert(d.verdict === "deny", "stale history does not leak into the verdict");
   } finally {
     auth.free();
   }

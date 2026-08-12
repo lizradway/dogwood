@@ -346,8 +346,12 @@ fn build_event(input: &EventInput) -> Result<Event, String> {
 /// rather than a complaint. Capturing the surface at lowering time lets
 /// [`DogwoodAuthorizer::is_authorized`] reject them up front instead.
 struct EventSurface {
-    /// Every **fully qualified** action id (`"Drupe::Action::Read"`).
-    actions: BTreeSet<String>,
+    /// Every action, **fully qualified id -> bare id**
+    /// (`"Drupe::Action::Read" -> "Read"`). The bare id is kept because
+    /// `Event::builder` recovers it by splitting on the *last* `::`, which is
+    /// wrong for the (legal, if rare) id that contains one — see
+    /// [`DogwoodAuthorizer::check`].
+    actions: BTreeMap<String, String>,
     /// Every declared event kind, decision points and history-only alike.
     kinds: BTreeSet<String>,
     /// The subset of [`kinds`](Self::kinds) that are decision points, in the
@@ -361,7 +365,7 @@ impl EventSurface {
     /// namespace (which already carries the trailing `Action` segment) joined
     /// onto its action id.
     fn of(lowered: &LoweredPolicySet) -> EventSurface {
-        let mut actions = BTreeSet::new();
+        let mut actions = BTreeMap::new();
         let mut kinds = BTreeSet::new();
         for sig in lowered.event_signatures() {
             let mut qualified = String::new();
@@ -370,7 +374,7 @@ impl EventSurface {
                 qualified.push_str("::");
             }
             qualified.push_str(sig.action());
-            actions.insert(qualified);
+            actions.insert(qualified, sig.action().to_string());
             kinds.insert(sig.kind().to_string());
         }
         EventSurface {
@@ -381,17 +385,18 @@ impl EventSurface {
     }
 }
 
-/// Render a set for an error message, capped so a schema with a hundred actions
+/// Render a list for an error message, capped so a schema with a hundred actions
 /// does not produce a hundred-line error.
-fn listing(items: &BTreeSet<String>) -> String {
+fn listing<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
     const CAP: usize = 8;
-    let shown = items
+    let all: Vec<&str> = items.into_iter().collect();
+    let shown = all
         .iter()
         .take(CAP)
         .map(|s| format!("`{s}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    match items.len().checked_sub(CAP) {
+    match all.len().checked_sub(CAP) {
         Some(rest) if rest > 0 => format!("{shown} (and {rest} more)"),
         _ => shown,
     }
@@ -484,26 +489,47 @@ impl DogwoodAuthorizer {
     /// event leaves the temporal history untouched — a failed call is a no-op,
     /// not a partial one.
     fn check(&self, event: &EventInput) -> Result<(), String> {
-        if !self.surface.actions.contains(&event.action) {
-            // An id whose last segment matches exactly one known action is
-            // almost always a missing namespace — the bare-`"Read"` mistake.
-            let tail = event.action.rsplit("::").next().unwrap_or(&event.action);
-            let mut same_tail = self
-                .surface
-                .actions
-                .iter()
-                .filter(|known| known.rsplit("::").next() == Some(tail));
-            let hint = match (same_tail.next(), same_tail.next()) {
-                (Some(only), None) => format!(" — did you mean `{only}`?"),
-                _ => String::new(),
-            };
-            return Err(format!(
-                "unknown action `{}`: not declared by the action schema, which declares {}. \
-                 Action ids are fully qualified, `Ns::Action::Id`{}",
-                event.action,
-                listing(&self.surface.actions),
-                hint,
-            ));
+        match self.surface.actions.get(&event.action) {
+            None => {
+                // An id whose last segment matches exactly one known action is
+                // almost always a missing namespace — the bare-`"Read"` mistake.
+                let tail = event.action.rsplit("::").next().unwrap_or(&event.action);
+                let mut same_tail = self
+                    .surface
+                    .actions
+                    .keys()
+                    .filter(|known| known.rsplit("::").next() == Some(tail));
+                let hint = match (same_tail.next(), same_tail.next()) {
+                    (Some(only), None) => format!(" — did you mean `{only}`?"),
+                    _ => String::new(),
+                };
+                return Err(format!(
+                    "unknown action `{}`: not declared by the action schema, which declares {}. \
+                     Action ids are fully qualified, `Ns::Action::Id`{}",
+                    event.action,
+                    listing(self.surface.actions.keys().map(String::as_str)),
+                    hint,
+                ));
+            }
+            // The action *is* declared, but its id contains `::`, which Cedar
+            // permits and `Event::builder` cannot express: the builder recovers
+            // the id by splitting on the last `::`, so `Drupe::Action::Read::Extra`
+            // becomes namespace `Drupe::Action::Read` + id `Extra` and resolves to
+            // nothing. That denies with an empty `errors` — the same
+            // indistinguishable-from-policy-said-no failure a bare id used to
+            // produce, so it is rejected on the same grounds rather than left to
+            // look like a decision.
+            Some(id) if id.contains("::") => {
+                return Err(format!(
+                    "action `{}` has an id containing `::` (`{id}`), which is not supported: \
+                     the event builder recovers the id by splitting on the last `::`, so this \
+                     action cannot be addressed unambiguously and would deny with no stated \
+                     cause. Rename the action in the schema, or drive it through `replay` \
+                     instead, whose `.log` parser takes the id quoted.",
+                    event.action,
+                ));
+            }
+            Some(_) => {}
         }
 
         if !self.surface.kinds.contains(&event.kind) {
@@ -511,8 +537,8 @@ impl DogwoodAuthorizer {
                 "unknown event kind `{}`. The event schema declares {} — of which {} \
                  {} a decision point",
                 event.kind,
-                listing(&self.surface.kinds),
-                listing(&self.surface.decision_kinds.iter().cloned().collect()),
+                listing(self.surface.kinds.iter().map(String::as_str)),
+                listing(self.surface.decision_kinds.iter().map(String::as_str)),
                 if self.surface.decision_kinds.len() == 1 { "is" } else { "are" },
             ));
         }
@@ -656,7 +682,7 @@ impl DogwoodAuthorizer {
     /// time.
     #[wasm_bindgen(getter)]
     pub fn actions(&self) -> Vec<String> {
-        self.surface.actions.iter().cloned().collect()
+        self.surface.actions.keys().cloned().collect()
     }
 
     /// The timestamp of the most recent event observed, or `undefined` before
