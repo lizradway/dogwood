@@ -18,6 +18,12 @@ members = [
     # runs each bundle through the `dogwood` binary, so a doc example that stops
     # compiling is a build failure.
     "dogwood-docs",
+    # The TypeScript/WebAssembly bindings: a `wasm-bindgen` shell over the same
+    # public surface the CLI drives, so the frontend is callable from Node and
+    # the browser. A workspace member (rather than a standalone crate) so its
+    # path dependency on `dogwood-language` is version-locked to this tree and
+    # a breaking change to the frontend fails its build here.
+    "dogwood-wasm",
 ]
 
 [workspace.package]

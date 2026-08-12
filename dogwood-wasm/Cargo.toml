@@ -1,0 +1,50 @@
+[package]
+name = "dogwood-wasm"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "TypeScript/WebAssembly bindings for the Dogwood policy frontend (validate, lower, replay, schema checks)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The Dogwood frontend. Only its curated public surface is used, exactly as
+# the `dogwood` CLI uses it.
+dogwood-language = { package = "amzn-dogwood-language", path = "../dogwood-language" }
+
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Idiomatic JS <-> serde conversion (returns real JS objects, not JSON strings).
+serde-wasm-bindgen = "0.6"
+# Emits real TypeScript `interface`s for the serde report types into the
+# generated .d.ts.
+tsify-next = { version = "0.5", features = ["js"] }
+# The frontend's error types are `miette::Diagnostic`s; the error projection
+# copied from the CLI walks them.
+miette = "7"
+
+# ── wasm randomness backends for transitive deps ───────────────────────
+# Cedar/ahash/const-random pull in `getrandom`. On wasm32-unknown-unknown it
+# has no default backend; these direct deps enable the JS-crypto backend for
+# both major versions in the tree (unified across the whole graph). getrandom
+# 0.3 also needs `--cfg getrandom_backend="wasm_js"`, set in .cargo/config.toml.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_legacy = { package = "getrandom", version = "0.2", features = ["js"] }
+# Cedar/mcp-tools-sdk pull in `uuid`, which likewise needs a wasm randomness
+# source; the `js` feature routes it through getrandom's JS backend.
+uuid = { version = "1", features = ["js"] }
+
+# Route Rust panics to console.error with a readable message during dev.
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
+
+# Rust/LLVM now emit bulk-memory and sign-extension ops by default; the
+# wasm-opt bundled with wasm-pack must be told to accept them. These features
+# are supported by every current wasm engine (Node 16+, modern browsers).
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-Os', '--enable-bulk-memory', '--enable-sign-ext', '--enable-nontrapping-float-to-int', '--enable-mutable-globals']

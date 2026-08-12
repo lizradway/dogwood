@@ -1,0 +1,24 @@
+{
+  // Type-checks `example.ts` against the generated `.d.ts` under `--strict`.
+  // Nothing is emitted: this exists to prove the bindings' TypeScript surface
+  // is sound and usable from strict-mode code, not to produce JS.
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2022",
+    // `ESNext.Disposable` is required: because the bindings export a wasm-bindgen
+    // *class* (`DogwoodAuthorizer`), the generated .d.ts declares
+    // `[Symbol.dispose]()`, which ES2022's lib does not know about. Needs
+    // TypeScript >= 5.2. Consumers type-checking against these bindings need the
+    // same lib (or `target: esnext`).
+    // ("DOM" only restores what target ES2022 pulls in by default — `console`
+    // and friends — since naming `lib` explicitly replaces that default.)
+    "lib": ["ES2022", "ESNext.Disposable", "DOM"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "skipLibCheck": false,
+    "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": false
+  },
+  "include": ["example.ts"]
+}
