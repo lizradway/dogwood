@@ -121,14 +121,27 @@ pub struct EntityInput {
 #[derive(Debug, Clone, Deserialize, tsify_next::Tsify)]
 #[tsify(from_wasm_abi)]
 pub struct EventInput {
-    /// The qualified Cedar action id — `"Drupe::Action::Read"`, or a bare
-    /// `"Read"`. Split on the **last** `::`, so an action id containing an
-    /// interior `::` is not supported (Cedar permits it; Dogwood's own
-    /// `Event::builder` has the same restriction).
+    /// The **fully qualified** Cedar action id — `"Drupe::Action::Read"`.
+    /// Split on the **last** `::`, so an action id containing an interior `::`
+    /// is not supported (Cedar permits it; Dogwood's own `Event::builder` has
+    /// the same restriction).
+    ///
+    /// A *bare* id (`"Read"`) parses but does not resolve to the namespaced
+    /// action a policy names, and the mismatch is **silent**: the decision comes
+    /// back `deny` with an empty
+    /// [`errors`](AuthorizerDecision::errors), indistinguishable from "policy
+    /// said no". Always qualify.
     pub action: String,
     /// The event kind. `"request"` (the default) is a decision point;
     /// `"response"` / `"error"` are history-only — they update temporal state
     /// and return `undefined`. Which kinds decide is set by the event schema.
+    ///
+    /// A kind the event schema does not declare at all is **not an error**: it
+    /// is treated as history-only and returns `undefined`. So a typo
+    /// (`"requst"`) silently yields no decision forever rather than failing
+    /// loudly — check against
+    /// [`decisionKinds`](DogwoodAuthorizer::decision_kinds) if the kind comes
+    /// from anywhere untrusted.
     #[serde(default = "default_kind")]
     #[tsify(optional)]
     pub kind: String,
@@ -340,6 +353,10 @@ pub struct DogwoodAuthorizer {
     /// Decision counter — the `index` of the next decision. History-only
     /// events do not advance it.
     decisions: usize,
+    /// The event kinds that are decision points, captured at lowering time.
+    /// Exposed so a host can tell a history-only kind from a typo, which
+    /// `is_authorized` cannot: both return `undefined`.
+    decision_kinds: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -366,6 +383,9 @@ impl DogwoodAuthorizer {
             macros: macros.as_deref(),
         };
         let lowered = lower_for_authorizer(source, &inputs, action_schema).map_err(crate::throw)?;
+        // Captured before the lowered set is moved into the authorizer, which
+        // consumes it.
+        let decision_kinds = lowered.decision_kinds().map(str::to_string).collect();
         Ok(DogwoodAuthorizer {
             authorizer: Authorizer::new(lowered),
             source: source.to_string(),
@@ -374,6 +394,7 @@ impl DogwoodAuthorizer {
             providers,
             macros,
             decisions: 0,
+            decision_kinds,
         })
     }
 
@@ -384,12 +405,29 @@ impl DogwoodAuthorizer {
     /// which still updates temporal history, and is how a host records the
     /// `response` half of a call so later policies can correlate against it.
     ///
-    /// Throws a plain `Error` if the event itself is malformed (a bad
-    /// `__entity` tag, say). A *policy* problem is never thrown: an evaluation
-    /// failure comes back as a fail-closed `deny` with the cause in
+    /// Throws a `DogwoodError` if the event itself is malformed (a missing
+    /// `action`, a bad `__entity` tag, a wrong-typed field). Such a throw leaves
+    /// the instance **usable** — the next call decides normally. A *policy*
+    /// problem is never thrown: an evaluation failure comes back as a
+    /// fail-closed `deny` with the cause in
     /// [`errors`](AuthorizerDecision::errors).
+    ///
+    /// The parameter is taken as a `JsValue` and deserialized here rather than
+    /// declared as `EventInput` directly, which is load-bearing: wasm-bindgen
+    /// acquires the `&mut self` borrow *before* converting arguments, so a
+    /// conversion that fails propagates the exception without releasing the
+    /// borrow — permanently poisoning the instance (every later call, `free()`
+    /// included, then fails with "recursive use of an object"). Converting
+    /// inside the body means the failure is an ordinary `Err` return and the
+    /// borrow is released. `unchecked_param_type` keeps the TypeScript
+    /// signature `EventInput`.
     #[wasm_bindgen(js_name = isAuthorized)]
-    pub fn is_authorized(&mut self, event: EventInput) -> Result<Option<AuthorizerDecision>, JsValue> {
+    pub fn is_authorized(
+        &mut self,
+        #[wasm_bindgen(unchecked_param_type = "EventInput")] event: JsValue,
+    ) -> Result<Option<AuthorizerDecision>, JsValue> {
+        let event: EventInput = serde_wasm_bindgen::from_value(event)
+            .map_err(|e| crate::throw(OpError::message(format!("invalid event: {e}"))))?;
         let built = build_event(&event).map_err(|e| crate::throw(OpError::message(e)))?;
 
         // `None` is a history-only event: temporal state advanced, no verdict.
@@ -429,6 +467,7 @@ impl DogwoodAuthorizer {
         };
         let lowered = lower_for_authorizer(&self.source, &inputs, &self.action_schema)
             .map_err(crate::throw)?;
+        self.decision_kinds = lowered.decision_kinds().map(str::to_string).collect();
         self.authorizer = Authorizer::new(lowered);
         self.decisions = 0;
         Ok(())
@@ -439,5 +478,17 @@ impl DogwoodAuthorizer {
     #[wasm_bindgen(getter, js_name = decisionCount)]
     pub fn decision_count(&self) -> usize {
         self.decisions
+    }
+
+    /// The event kinds that are decision points under this instance's event
+    /// schema (`["request"]` by default).
+    ///
+    /// [`isAuthorized`](Self::is_authorized) returns `undefined` both for a
+    /// legitimately history-only kind and for a kind the schema never declared,
+    /// so a typo is otherwise indistinguishable from a `response`. Checking
+    /// membership here turns that silent no-op into a detectable one.
+    #[wasm_bindgen(getter, js_name = decisionKinds)]
+    pub fn decision_kinds(&self) -> Vec<String> {
+        self.decision_kinds.clone()
     }
 }

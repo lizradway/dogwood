@@ -7,7 +7,7 @@
     "build": "wasm-pack build --release --target nodejs --out-dir pkg",
     "build:bundler": "wasm-pack build --release --target bundler --out-dir pkg-bundler",
     "build:web": "wasm-pack build --release --target web --out-dir pkg-web",
-    "test": "node test.cjs && node test-live.cjs",
+    "test": "node test.cjs && node test-live.cjs && node test-coverage.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "verify": "npm run test && npm run typecheck"
   },

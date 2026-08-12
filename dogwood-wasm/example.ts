@@ -114,6 +114,16 @@ const noDecision: AuthorizerDecision | undefined = auth.isAuthorized({
 if (noDecision === undefined) console.log("history-only event: no verdict");
 
 const _count: number = auth.decisionCount;
+
+// `isAuthorized` returns undefined both for a legitimately history-only kind and
+// for a kind the event schema never declared, so a typo yields no decision
+// rather than an error. When the kind comes from anywhere untrusted, check it.
+const kinds: string[] = auth.decisionKinds;
+function isDecisionPoint(kind: string): boolean {
+  return kinds.includes(kind);
+}
+console.log(isDecisionPoint("request"), isDecisionPoint("requst"));
+
 auth.reset(); // drop accumulated history, re-lower the same sources
 
 // An authorizer owns wasm-side memory (the lowered policy set plus the temporal

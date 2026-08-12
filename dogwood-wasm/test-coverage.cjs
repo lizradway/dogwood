@@ -1,0 +1,885 @@
+// Surface-coverage suite: every exported function, every report field, every
+// optional argument, every error path, and every value-conversion branch.
+//
+// `test.cjs` smoke-tests the happy path and `test-live.cjs` pins the live
+// authorizer's semantics against `replay`. This file exists to answer a
+// different question — "is any part of the binding surface unexercised?" — so it
+// is organised by API surface rather than by scenario, and it deliberately
+// asserts the *unhappy* paths: what each function does with malformed input,
+// and which mistakes fail silently rather than loudly.
+//
+// The three optional service-schema arguments (`eventSchema`, `providers`,
+// `macros`) get load-bearing tests: each is exercised with a pair of calls that
+// differ ONLY in that argument and must produce different results. An override
+// that was silently ignored would pass a single-call test.
+const dw = require("./pkg/dogwood_wasm.js");
+
+let pass = 0,
+  fail = 0;
+function check(name, fn) {
+  try {
+    fn();
+    console.log(`  ok   ${name}`);
+    pass++;
+  } catch (e) {
+    console.log(`  FAIL ${name}: ${e && e.message ? e.message : e}`);
+    fail++;
+  }
+}
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || "assertion failed");
+}
+/** Assert that `fn` throws, and return the thrown error for further checks. */
+function throws(fn, msg) {
+  let threw = null;
+  try {
+    fn();
+  } catch (e) {
+    threw = e;
+  }
+  assert(threw !== null, msg || "expected a throw, got none");
+  return threw;
+}
+
+// ─── fixtures ────────────────────────────────────────────────────────
+//
+// The action schema mirrors the frontend's own provider_only corpus schema, so
+// the provider cases below are the corpus's cases and their expected verdicts
+// are the corpus's expected verdicts.
+const SCHEMA = `namespace Drupe {
+  entity Gateway;
+  entity OAuthUser = { id: String } tags String;
+  type ReadInput = { document: String };
+  type ReadOutput = { content: String };
+  action "Read" appliesTo {
+    principal: [OAuthUser], resource: [Gateway],
+    context: { input: ReadInput, output: ReadOutput }
+  };
+}`;
+
+const ALLOW_ALL = `permit(principal, action == Drupe::Action::"Read", resource);`;
+
+const PRINCIPAL = { type: "Drupe::OAuthUser", id: "alice" };
+const RESOURCE = { type: "Drupe::Gateway", id: "gw1" };
+
+/** A decision-kind event, with `input` in both datasets. */
+function event(ts, extra = {}) {
+  const input = { document: "d" };
+  return {
+    action: "Drupe::Action::Read",
+    kind: "request",
+    timestamp: ts,
+    principal: PRINCIPAL,
+    resource: RESOURCE,
+    logged: { input },
+    context: { input },
+    ...extra,
+  };
+}
+
+// Event schemas taken verbatim in shape from
+// `dogwood-language/configuration/event-schemas/`.
+const CUSTOM_KINDS = `
+decision event <A>::attempt {
+    ...inputs(A),
+    actor: principalType(A),
+}
+event <A>::outcome {
+    ...inputs(A),
+    ...outputs(A),
+    actor: principalType(A),
+}`;
+
+const WIDE_WINDOW_SCHEMA = `max_window = 7d
+decision event <A>::request {
+    ...inputs(A),
+    callerPrincipal: principalType(A),
+    callerResource:  resourceType(A),
+    requestId:       String,
+}
+event <A>::response {
+    ...inputs(A),
+    ...outputs(A),
+    callerPrincipal: principalType(A),
+    callerResource:  resourceType(A),
+    requestId:       String,
+}`;
+
+// An information provider with its Rhai script INLINE. `scriptFile` cannot work
+// here — see the dedicated test below.
+const RHAI_SCRIPT = `fn evaluate(text, pattern) {
+  if type_of(text) == "()" || type_of(pattern) == "()" { return #{ matched: false }; }
+  #{ matched: regex_is_match(pattern, text) }
+}`;
+function providersJson(implementation) {
+  return JSON.stringify({
+    availableProviders: {
+      "Strings::Matches": {
+        argumentTypes: [{ paramType: "string" }, { paramType: "string" }],
+        outputType: {
+          paramType: "record",
+          fields: { matched: { paramType: "bool" } },
+          required: ["matched"],
+        },
+        implementation,
+      },
+    },
+  });
+}
+const PROVIDERS_INLINE = providersJson({ kind: "rhai", script: RHAI_SCRIPT });
+const PROVIDERS_SCRIPTFILE = providersJson({ kind: "rhai", scriptFile: "matches.rhai" });
+
+const GUARDRAIL_POLICY = `permit(principal, action == Drupe::Action::"Read", resource)
+when guardrails { Strings::Matches(context.input.document, "^[A-Z]+$").matched == true };`;
+
+const MACROS = `def temporal seen_within(?w) {
+    formerly within ?w Drupe::Action::"Read"::response{}
+};`;
+const MACRO_POLICY = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { seen_within(1h) };`;
+
+/** A `.log` line for the Read action. */
+function traceLine(ts, doc) {
+  const d = JSON.stringify(doc);
+  return (
+    `@${ts} scope(principal: Drupe::OAuthUser::"alice", resource: Drupe::Gateway::"gw1") ` +
+    `request_context(input: { document: ${d} }) ` +
+    `Drupe::Action::"Read"::request(callerPrincipal: Drupe::OAuthUser::"alice", ` +
+    `input: { document: ${d} })`
+  );
+}
+
+console.log("Dogwood binding surface-coverage tests\n");
+
+// ═══ 1. checkParse ═══════════════════════════════════════════════════
+console.log("checkParse");
+
+check("reports policy_count over a multi-policy set", () => {
+  const r = dw.checkParse(`${ALLOW_ALL}\nforbid(principal, action, resource);`);
+  assert(r.policy_count === 2, "policy_count, got " + r.policy_count);
+  assert(r.policies.length === 2, "one summary per policy");
+});
+
+check("summarizes every PolicySummary field", () => {
+  const r = dw.checkParse(GUARDRAIL_POLICY);
+  const p = r.policies[0];
+  // All four fields, each with a meaningful value rather than just "defined".
+  assert(p.temporal_count === 0, "temporal_count on a non-temporal policy");
+  assert(p.uses_temporal === false, "uses_temporal");
+  assert(
+    JSON.stringify(p.provider_invocations) === JSON.stringify(["Strings::Matches"]),
+    "provider_invocations, got " + JSON.stringify(p.provider_invocations),
+  );
+  assert(
+    JSON.stringify(p.undeclared_providers) === JSON.stringify(["Strings::Matches"]),
+    "an undeclared provider is reported, got " + JSON.stringify(p.undeclared_providers),
+  );
+});
+
+check("counts multiple temporal leaves", () => {
+  const two = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { formerly within 1h Drupe::Action::"Read"::response{} }
+when temporal { formerly within 2h Drupe::Action::"Read"::response{} };`;
+  const p = dw.checkParse(two).policies[0];
+  assert(p.uses_temporal === true, "uses_temporal");
+  assert(p.temporal_count === 2, "temporal_count, got " + p.temporal_count);
+});
+
+// LOAD-BEARING: the `providers` override must reach check_parse. These two calls
+// differ only in that argument; if it were dropped, both would report the
+// provider as undeclared and this test would fail.
+check("the providers override is wired (undeclared_providers clears)", () => {
+  const without = dw.checkParse(GUARDRAIL_POLICY).policies[0];
+  const withDecl = dw.checkParse(GUARDRAIL_POLICY, undefined, PROVIDERS_INLINE).policies[0];
+  assert(without.undeclared_providers.length === 1, "undeclared without the override");
+  assert(
+    withDecl.undeclared_providers.length === 0,
+    "declared WITH the override, got " + JSON.stringify(withDecl.undeclared_providers),
+  );
+  // The invocation itself is reported either way — only declaredness changes.
+  assert(withDecl.provider_invocations.length === 1, "invocation still reported");
+});
+
+check("throws DogwoodError on a syntax error, with byte offsets into the source", () => {
+  const src = "permit(principal action resource);";
+  const e = throws(() => dw.checkParse(src));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(e.diagnostic.severity === "error", "severity");
+  assert(typeof e.diagnostic.message === "string" && e.diagnostic.message.length > 0, "message");
+  assert(Array.isArray(e.diagnostic.labels) && e.diagnostic.labels.length > 0, "labels present");
+  const l = e.diagnostic.labels[0];
+  // The contract is that offsets index the string that was passed in.
+  assert(
+    l.start >= 0 && l.start + l.len <= src.length,
+    `label ${l.start}..${l.start + l.len} must fall inside the ${src.length}-byte source`,
+  );
+});
+
+check("throws on an unknown macro (no default def)", () => {
+  const e = throws(() => dw.checkParse(MACRO_POLICY));
+  assert(/seen_within/.test(e.message), "message names the macro, got " + e.message);
+});
+
+// ═══ 2. validate ═════════════════════════════════════════════════════
+console.log("\nvalidate");
+
+check("passes a well-typed policy, with all four fields set", () => {
+  const r = dw.validate(ALLOW_ALL, SCHEMA);
+  assert(r.passed === true, "passed, errors: " + JSON.stringify(r.errors));
+  assert(r.passed_without_warnings === true, "passed_without_warnings");
+  assert(Array.isArray(r.errors) && r.errors.length === 0, "errors empty");
+  assert(Array.isArray(r.warnings) && r.warnings.length === 0, "warnings empty");
+});
+
+check("returns (does not throw) a type error, with a full Diagnostic", () => {
+  const src = `permit(principal, action == Drupe::Action::"Read", resource)
+when { context.input.nope == "x" };`;
+  const r = dw.validate(src, SCHEMA);
+  assert(r.passed === false, "a bad attribute must fail validation");
+  assert(r.passed_without_warnings === false, "passed_without_warnings");
+  assert(r.errors.length >= 1, "an error is reported");
+  const d = r.errors[0];
+  assert(d.severity === "error", "severity, got " + d.severity);
+  assert(typeof d.code === "string", "code present, got " + d.code);
+  assert(/nope/.test(d.message), "message names the bad attribute, got " + d.message);
+  assert(d.labels.length >= 1 && typeof d.labels[0].start === "number", "labels carry offsets");
+  assert(
+    d.labels[0].start + d.labels[0].len <= src.length,
+    "offsets index the .dw source that was passed in",
+  );
+  assert(typeof d.help === "string" && d.help.length > 0, "help text present");
+  assert(d.spanned === true, "spanned");
+});
+
+// LOAD-BEARING: the `eventSchema` override must reach lowering. The SAME policy
+// validates differently under the two schemas — the only difference is the
+// `max_window` cap — so an ignored override could not produce both results.
+check("the eventSchema override is wired (max_window gates the same policy)", () => {
+  const wide = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { formerly within 7d Drupe::Action::"Read"::response{} };`;
+  const underDefault = dw.validate(wide, SCHEMA);
+  assert(
+    underDefault.passed === false,
+    "`within 7d` must exceed the default 24h cap",
+  );
+  assert(
+    /max_window|24h/.test(underDefault.errors[0].message),
+    "the error explains the cap, got " + underDefault.errors[0].message,
+  );
+  const underWide = dw.validate(wide, SCHEMA, WIDE_WINDOW_SCHEMA);
+  assert(
+    underWide.passed === true,
+    "raising max_window to 7d must admit it, errors: " + JSON.stringify(underWide.errors),
+  );
+});
+
+// LOAD-BEARING: the `macros` override must reach parsing.
+check("the macros override is wired (a custom def resolves)", () => {
+  throws(() => dw.validate(MACRO_POLICY, SCHEMA), "unknown macro must throw without the library");
+  const r = dw.validate(MACRO_POLICY, SCHEMA, undefined, undefined, MACROS);
+  assert(r.passed === true, "with the library it validates, errors: " + JSON.stringify(r.errors));
+});
+
+check("throws (not returns) on a fatal parse error", () => {
+  const e = throws(() => dw.validate("permit(", SCHEMA));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+});
+
+check("a bad action schema throws, with offsets into the SCHEMA text", () => {
+  const badSchema = "namespace Drupe { entity User";
+  const e = throws(() => dw.validate(ALLOW_ALL, badSchema));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  if (e.diagnostic.labels && e.diagnostic.labels.length > 0) {
+    const l = e.diagnostic.labels[0];
+    assert(
+      l.start + l.len <= badSchema.length,
+      `a schema error's offsets must index the schema (${l.start}..${l.start + l.len} vs ` +
+        `${badSchema.length}), not the .dw source`,
+    );
+  }
+});
+
+// ═══ 3. lower ════════════════════════════════════════════════════════
+console.log("\nlower");
+
+check("emits every artifact field, and the schema round-trips", () => {
+  const a = dw.lower(ALLOW_ALL, SCHEMA);
+  assert(a.cedar_policies.includes("permit"), "cedar_policies is Cedar text");
+  assert(a.cedar_schema.includes("Drupe"), "cedar_schema is schema text");
+  // The augmented schema must itself be a valid Cedar schema.
+  assert(dw.checkActionSchema(a.cedar_schema).ok === true, "augmented schema re-checks clean");
+  const json = JSON.parse(a.cedar_schema_json); // must not throw
+  assert(Object.keys(json).includes("Drupe"), "cedar_schema_json has the namespace");
+  assert(a.self_contained === true, "a plain policy is self-contained");
+  assert(Array.isArray(a.temporal_fields) && a.temporal_fields.length === 0, "no temporal fields");
+  assert(Array.isArray(a.provider_fields) && a.provider_fields.length === 0, "no provider fields");
+  assert(
+    JSON.stringify(a.decision_kinds) === JSON.stringify(["request"]),
+    "decision_kinds defaults to [request], got " + JSON.stringify(a.decision_kinds),
+  );
+});
+
+check("hoists temporal fields and drops self_contained", () => {
+  const t = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { formerly within 1h Drupe::Action::"Read"::response{} };`;
+  const a = dw.lower(t, SCHEMA);
+  assert(a.self_contained === false, "temporal needs Dogwood at authorize time");
+  assert(a.temporal_fields.length === 1, "one hoisted field, got " + a.temporal_fields.length);
+  assert(typeof a.temporal_fields[0] === "string", "field ids are strings");
+});
+
+check("hoists provider fields and drops self_contained", () => {
+  const a = dw.lower(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_INLINE);
+  assert(a.self_contained === false, "a provider policy is not self-contained");
+  assert(a.provider_fields.length === 1, "one provider field, got " + JSON.stringify(a.provider_fields));
+  assert(a.temporal_fields.length === 0, "and no temporal fields");
+});
+
+check("decision_kinds follows the event schema", () => {
+  const a = dw.lower(ALLOW_ALL, SCHEMA, CUSTOM_KINDS);
+  assert(
+    JSON.stringify(a.decision_kinds) === JSON.stringify(["attempt"]),
+    "custom-kinds schema decides on `attempt`, got " + JSON.stringify(a.decision_kinds),
+  );
+});
+
+// ═══ 4. replay ═══════════════════════════════════════════════════════
+console.log("\nreplay");
+
+check("returns an empty stream for an empty trace", () => {
+  const r = dw.replay(ALLOW_ALL, SCHEMA, "");
+  assert(Array.isArray(r.verdicts) && r.verdicts.length === 0, "no verdicts");
+});
+
+check("indexes a multi-event trace and fills every TimepointVerdict field", () => {
+  const trace = [traceLine(1000, "a"), traceLine(1010, "b")].join("\n");
+  const r = dw.replay(ALLOW_ALL, SCHEMA, trace);
+  assert(r.verdicts.length === 2, "two decisions, got " + r.verdicts.length);
+  r.verdicts.forEach((v, i) => {
+    assert(v.index === i, `index ${i}, got ${v.index}`);
+    assert(v.verdict === "allow", "verdict");
+    assert(Array.isArray(v.errors) && v.errors.length === 0, "no errors");
+    assert(Array.isArray(v.determining_rules), "determining_rules is an array");
+  });
+  assert(r.verdicts[0].timestamp === 1000 && r.verdicts[1].timestamp === 1010, "timestamps");
+  assert(r.verdicts[0].determining_rules.length === 1, "an allow names its rule");
+});
+
+check("an implicit deny carries no determining rules", () => {
+  const r = dw.replay(`forbid(principal, action, resource);`, SCHEMA, traceLine(1000, "a"));
+  assert(r.verdicts[0].verdict === "deny", "deny");
+  assert(
+    r.verdicts[0].determining_rules.length === 1,
+    "an explicit forbid names its rule, got " + JSON.stringify(r.verdicts[0].determining_rules),
+  );
+  const r2 = dw.replay(
+    `permit(principal, action == Drupe::Action::"Read", resource)
+when { context.input.document == "never" };`,
+    SCHEMA,
+    traceLine(1000, "a"),
+  );
+  assert(r2.verdicts[0].verdict === "deny", "unmatched permit denies");
+  assert(
+    r2.verdicts[0].determining_rules.length === 0,
+    "an IMPLICIT deny names no rule, got " + JSON.stringify(r2.verdicts[0].determining_rules),
+  );
+});
+
+check("throws on a malformed trace, with offsets into the LOG text", () => {
+  const badLog = "@@@ nonsense";
+  const e = throws(() => dw.replay(ALLOW_ALL, SCHEMA, badLog));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(/trace|timestamp/i.test(e.message), "message mentions the trace, got " + e.message);
+});
+
+check("providers execute during replay (Rhai runs under wasm)", () => {
+  // The frontend's own corpus case 0001: "ABC" matches ^[A-Z]+$, "abc" does not.
+  const trace = [traceLine(0, "ABC"), traceLine(10, "abc"), traceLine(20, "AB12")].join("\n");
+  const r = dw.replay(GUARDRAIL_POLICY, SCHEMA, trace, undefined, PROVIDERS_INLINE);
+  const got = r.verdicts.map((v) => v.verdict).join(",");
+  assert(got === "allow,deny,deny", "expected allow,deny,deny — got " + got);
+  assert(r.verdicts[0].errors.length === 0, "a working provider reports no errors");
+});
+
+// ═══ 5. schema checks ════════════════════════════════════════════════
+console.log("\ncheckActionSchema / checkEventSchema / checkProviders");
+
+check("checkActionSchema accepts a valid schema and reports its kind", () => {
+  const r = dw.checkActionSchema(SCHEMA);
+  assert(r.ok === true, "ok");
+  assert(r.kind === "action", "kind, got " + r.kind);
+});
+
+check("checkActionSchema throws on a malformed schema", () => {
+  const e = throws(() => dw.checkActionSchema("namespace { entity"));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(e.diagnostic.severity === "error", "severity");
+});
+
+check("checkEventSchema accepts the default-shaped and custom-kind schemas", () => {
+  const r = dw.checkEventSchema(CUSTOM_KINDS);
+  assert(r.ok === true, "ok");
+  assert(r.kind === "event", "kind, got " + r.kind);
+  assert(dw.checkEventSchema(WIDE_WINDOW_SCHEMA).ok === true, "a max_window directive is accepted");
+});
+
+check("checkEventSchema throws on a malformed schema", () => {
+  const e = throws(() => dw.checkEventSchema("not an event schema"));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(/event schema/i.test(e.message), "message names the artifact, got " + e.message);
+});
+
+check("checkProviders accepts a well-formed declarations file", () => {
+  const r = dw.checkProviders(PROVIDERS_INLINE);
+  assert(r.ok === true, "ok");
+  assert(r.kind === "providers", "kind, got " + r.kind);
+});
+
+check("checkProviders throws on malformed JSON", () => {
+  const e = throws(() => dw.checkProviders("{"));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(/providers/i.test(e.message), "message names the artifact, got " + e.message);
+});
+
+check("checkProviders throws on JSON that is not a declarations file", () => {
+  throws(() => dw.checkProviders(`{"availableProviders": {"Bad::P": {"nonsense": 1}}}`));
+});
+
+// A false green worth pinning: the check passes, but the provider can never run
+// here. Documented in the README; asserted so the behaviour cannot drift
+// unnoticed into a silent wrong answer.
+check("a scriptFile provider passes checkProviders but fails CLOSED at authorize time", () => {
+  assert(
+    dw.checkProviders(PROVIDERS_SCRIPTFILE).ok === true,
+    "checkProviders cannot see that the script is unresolved",
+  );
+  const r = dw.replay(GUARDRAIL_POLICY, SCHEMA, traceLine(0, "ABC"), undefined, PROVIDERS_SCRIPTFILE);
+  assert(r.verdicts[0].verdict === "deny", "must fail closed, not allow");
+  assert(
+    r.verdicts[0].errors.length > 0,
+    "and must say why — a silent deny would be indistinguishable from policy-said-no",
+  );
+  assert(
+    /scriptFile|no script/.test(r.verdicts[0].errors[0]),
+    "the cause names the unresolved script, got " + r.verdicts[0].errors[0],
+  );
+});
+
+// ═══ 6. mcpToCedarSchema ═════════════════════════════════════════════
+console.log("\nmcpToCedarSchema");
+
+check("generates a schema that is itself valid and usable for lowering", () => {
+  const manifest = JSON.stringify([
+    {
+      name: "SellShares",
+      description: "Sell shares of a stock.",
+      inputSchema: {
+        type: "object",
+        properties: { stock: { type: "string" }, shares: { type: "integer" } },
+        required: ["stock", "shares"],
+      },
+    },
+  ]);
+  const generated = dw.mcpToCedarSchema(manifest);
+  assert(generated.includes("SellShares"), "names the action");
+  // Not just "is a string": it must round-trip through the schema checker AND
+  // actually work as an action schema.
+  assert(dw.checkActionSchema(generated).ok === true, "generated schema is valid Cedar");
+  const r = dw.validate(
+    `permit(principal, action == Drupe::Action::"SellShares", resource)
+when { context.input.stock == "ACME" };`,
+    generated,
+  );
+  assert(r.passed === true, "a policy over the generated action validates: " + JSON.stringify(r.errors));
+});
+
+check("an empty manifest yields the bare template", () => {
+  const s = dw.mcpToCedarSchema("[]");
+  assert(typeof s === "string" && s.length > 0, "still returns the template");
+  assert(dw.checkActionSchema(s).ok === true, "and it is valid");
+});
+
+check("throws on a malformed manifest", () => {
+  const e = throws(() => dw.mcpToCedarSchema("{not json"));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(/manifest/i.test(e.message), "message names the manifest, got " + e.message);
+});
+
+// ═══ 7. DogwoodAuthorizer — overrides and kinds ══════════════════════
+console.log("\nDogwoodAuthorizer: overrides, kinds, lifecycle");
+
+check("providers execute through the live authorizer too", () => {
+  const auth = new dw.DogwoodAuthorizer(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_INLINE);
+  try {
+    const yes = auth.isAuthorized(event(0, { logged: { input: { document: "ABC" } }, context: { input: { document: "ABC" } } }));
+    const no = auth.isAuthorized(event(10, { logged: { input: { document: "abc" } }, context: { input: { document: "abc" } } }));
+    assert(yes.verdict === "allow", "uppercase allowed, got " + JSON.stringify(yes));
+    assert(no.verdict === "deny", "lowercase denied, got " + no.verdict);
+    assert(yes.errors.length === 0, "no evaluation errors");
+  } finally {
+    auth.free();
+  }
+});
+
+// LOAD-BEARING: a custom event schema must change WHICH KINDS DECIDE. Under
+// `custom-kinds`, `attempt` decides and the default `request` does not — so an
+// ignored eventSchema argument would invert both assertions.
+check("a custom event schema changes which kinds decide", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA, CUSTOM_KINDS);
+  try {
+    assert(
+      JSON.stringify(auth.decisionKinds) === JSON.stringify(["attempt"]),
+      "decisionKinds reflects the schema, got " + JSON.stringify(auth.decisionKinds),
+    );
+    const decided = auth.isAuthorized(event(100, { kind: "attempt" }));
+    assert(decided !== undefined && decided.verdict === "allow", "`attempt` decides");
+    assert(
+      auth.isAuthorized(event(110, { kind: "outcome" })) === undefined,
+      "`outcome` is history-only",
+    );
+    assert(
+      auth.isAuthorized(event(120, { kind: "request" })) === undefined,
+      "`request` does NOT decide under this schema",
+    );
+  } finally {
+    auth.free();
+  }
+});
+
+check("decisionKinds defaults to [request] and survives reset", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    assert(JSON.stringify(auth.decisionKinds) === JSON.stringify(["request"]), "default");
+    auth.reset();
+    assert(JSON.stringify(auth.decisionKinds) === JSON.stringify(["request"]), "after reset");
+  } finally {
+    auth.free();
+  }
+});
+
+// A silent failure mode, pinned so it stays documented rather than surprising:
+// an undeclared kind is treated as history-only, NOT rejected.
+check("an unrecognized kind is a silent no-op (detectable only via decisionKinds)", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const d = auth.isAuthorized(event(100, { kind: "requst" })); // typo
+    assert(d === undefined, "a typo'd kind yields no decision rather than throwing");
+    assert(auth.decisionCount === 0, "and no decision is counted");
+    // This is the check a host must make for itself.
+    assert(
+      !auth.decisionKinds.includes("requst"),
+      "decisionKinds is what makes the typo detectable",
+    );
+  } finally {
+    auth.free();
+  }
+});
+
+// Another silent failure mode: an unqualified action id denies with no errors.
+check("a bare (unqualified) action id denies silently — always qualify", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const qualified = auth.isAuthorized(event(100));
+    const bare = auth.isAuthorized(event(110, { action: "Read" }));
+    assert(qualified.verdict === "allow", "the qualified id allows");
+    assert(bare.verdict === "deny", "the bare id denies, got " + bare.verdict);
+    assert(
+      bare.errors.length === 0,
+      "and carries NO errors — indistinguishable from policy-said-no, which is " +
+        "why the docs require a qualified id",
+    );
+  } finally {
+    auth.free();
+  }
+});
+
+check("macros override reaches the live authorizer", () => {
+  throws(
+    () => new dw.DogwoodAuthorizer(MACRO_POLICY, SCHEMA),
+    "an unknown macro must throw from the constructor",
+  );
+  const auth = new dw.DogwoodAuthorizer(MACRO_POLICY, SCHEMA, undefined, undefined, MACROS);
+  try {
+    assert(auth.isAuthorized(event(100)) !== undefined, "and with the library it decides");
+  } finally {
+    auth.free();
+  }
+});
+
+check("a bad action schema throws from the constructor", () => {
+  const e = throws(() => new dw.DogwoodAuthorizer(ALLOW_ALL, "namespace Drupe { entity"));
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+});
+
+check("a malformed providers.json throws from the constructor", () => {
+  throws(() => new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA, undefined, "{"));
+});
+
+check("a malformed event schema throws from the constructor", () => {
+  throws(() => new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA, "not a schema"));
+});
+
+// ═══ 8. value conversion — every branch of to_value ══════════════════
+console.log("\nvalue conversion");
+
+check("accepts every JSON value kind plus both tagged escapes", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const d = auth.isAuthorized(
+      event(1, {
+        logged: {
+          input: { document: "d" },
+          edge: {
+            nul: null, // Value::Null
+            yes: true, // Value::Bool
+            no: false,
+            zero: 0, // Value::Int
+            neg: -42,
+            i64ish: 9007199254740991, // largest exact JS integer
+            frac: 2.5, // -> Decimal (non-integral number)
+            negFrac: -0.125,
+            str: "plain", // Value::String
+            uni: "héllo → 世界 🎉", // multi-byte, must survive the ABI
+            quoted: 'has "quotes" and \\ backslash',
+            arr: [1, "two", false, null], // Value::Array, mixed
+            emptyArr: [],
+            obj: { a: 1, b: { c: "deep" } }, // Value::Object, nested
+            emptyObj: {},
+            ent: { __entity: { type: "Drupe::OAuthUser", id: "bob" } },
+            dec: { __decimal: "1.50" }, // exact text preserved
+            deepMix: [{ __decimal: "0.01" }, [{ __entity: { type: "Drupe::Gateway", id: "g" } }]],
+          },
+        },
+      }),
+    );
+    assert(d.verdict === "allow", "conversion must not disturb the decision: " + JSON.stringify(d));
+  } finally {
+    auth.free();
+  }
+});
+
+check("each malformed tagged value throws a naming Error", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const bad = (v) => () => auth.isAuthorized(event(1, { logged: { e: { x: v } } }));
+    // Every error branch in to_value, each asserted to name its tag.
+    assert(/__entity/.test(throws(bad({ __entity: { type: "T" } })).message), "missing id");
+    assert(/__entity/.test(throws(bad({ __entity: { id: "i" } })).message), "missing type");
+    assert(/__entity/.test(throws(bad({ __entity: "nope" })).message), "not an object");
+    assert(
+      /__entity/.test(throws(bad({ __entity: { type: "T", id: "i" }, extra: 1 })).message),
+      "extra sibling key",
+    );
+    assert(/__decimal/.test(throws(bad({ __decimal: 1.5 })).message), "non-string decimal");
+    assert(
+      /__decimal/.test(throws(bad({ __decimal: "1.5", extra: 1 })).message),
+      "extra sibling key",
+    );
+    assert(
+      /__entity/.test(throws(bad({ __entity: { type: 1, id: "i" } })).message),
+      "non-string type",
+    );
+  } finally {
+    auth.free();
+  }
+});
+
+// An integer must stay a Cedar Long. The conversion goes JS number ->
+// serde_json::Value -> Dogwood Value, and if the middle step rendered integers
+// as floats they would become Decimals, which a `Long` comparison rejects. This
+// test would catch that as a fail-closed deny.
+check("an integer attribute stays an integer (not a decimal)", () => {
+  const schema = `namespace Drupe {
+  entity Gateway;
+  entity OAuthUser = { id: String, count: Long } tags String;
+  type ReadInput = { document: String };
+  action "Read" appliesTo {
+    principal: [OAuthUser], resource: [Gateway], context: { input: ReadInput }
+  };
+}`;
+  const policy = `permit(principal, action == Drupe::Action::"Read", resource)
+when { principal.count == 3 };`;
+  const auth = new dw.DogwoodAuthorizer(policy, schema);
+  try {
+    const d = auth.isAuthorized(
+      event(1, { entities: [{ type: "Drupe::OAuthUser", id: "alice", attrs: { id: "alice", count: 3 } }] }),
+    );
+    assert(
+      d.verdict === "allow",
+      "3 must compare equal to the Long 3, got " + JSON.stringify(d),
+    );
+    const no = auth.isAuthorized(
+      event(2, { entities: [{ type: "Drupe::OAuthUser", id: "alice", attrs: { id: "alice", count: 4 } }] }),
+    );
+    assert(no.verdict === "deny", "and 4 must not, got " + no.verdict);
+    assert(no.errors.length === 0, "a plain mismatch is not an evaluation error");
+  } finally {
+    auth.free();
+  }
+});
+
+// REGRESSION: an argument that fails to deserialize must not poison the
+// instance. wasm-bindgen takes the `&mut self` borrow before converting
+// arguments, so a naive `event: EventInput` parameter leaks the borrow on a
+// conversion error — after which every method, `free()` included, throws
+// "recursive use of an object" and the wasm-heap allocation can never be
+// released. `isAuthorized` deserializes inside the body to avoid that.
+check("a malformed event throws but leaves the instance fully usable", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const cases = [
+      [{ timestamp: 1 }, /action/, "missing required `action`"],
+      [{ action: "Drupe::Action::Read", timestamp: "soon" }, /i64|timestamp/, "wrong-typed timestamp"],
+      [null, /EventInput|invalid/, "null instead of an object"],
+      [{ action: "Drupe::Action::Read", entities: "nope" }, /invalid|sequence/, "wrong-typed entities"],
+    ];
+    for (const [bad, pattern, label] of cases) {
+      const e = throws(() => auth.isAuthorized(bad), `expected a throw for ${label}`);
+      assert(e instanceof Error, `${label}: is a real Error`);
+      assert(
+        pattern.test(e.message),
+        `${label}: message should match ${pattern}, got ${e.message}`,
+      );
+      // The instance must still work after EACH failure, not just the last.
+      const ok = auth.isAuthorized(event(1));
+      assert(ok !== undefined && ok.verdict === "allow", `${label}: instance still decides`);
+      assert(typeof auth.decisionCount === "number", `${label}: getters still work`);
+    }
+    auth.reset(); // must also still work
+  } finally {
+    // The real tell: a poisoned instance cannot be freed at all.
+    auth.free();
+  }
+});
+
+check("optional event fields all default", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    // Only `action` is required; everything else has a default. A bare event
+    // must not throw (it decides on an empty request, which denies).
+    const d = auth.isAuthorized({ action: "Drupe::Action::Read" });
+    assert(d !== undefined, "kind defaults to `request`, so this is a decision point");
+    assert(d.timestamp === 0, "timestamp defaults to 0, got " + d.timestamp);
+    assert(d.verdict === "deny", "an attribute-less request denies");
+  } finally {
+    auth.free();
+  }
+});
+
+check("entities merge across attrs and parents for the same (type, id)", () => {
+  const policy = `permit(principal in Drupe::Gateway::"fleet", action == Drupe::Action::"Read", resource)
+when { principal.id == "alice" };`;
+  const schema = `namespace Drupe {
+  entity Gateway;
+  entity OAuthUser in [Gateway] = { id: String } tags String;
+  type ReadInput = { document: String };
+  action "Read" appliesTo {
+    principal: [OAuthUser], resource: [Gateway], context: { input: ReadInput }
+  };
+}`;
+  const auth = new dw.DogwoodAuthorizer(policy, schema);
+  try {
+    // One entity carrying BOTH an attribute and a parent: the policy needs both
+    // to allow, so a builder that dropped either would deny.
+    const d = auth.isAuthorized(
+      event(1, {
+        entities: [
+          {
+            type: "Drupe::OAuthUser",
+            id: "alice",
+            attrs: { id: "alice" },
+            parents: [{ type: "Drupe::Gateway", id: "fleet" }],
+          },
+        ],
+      }),
+    );
+    assert(d.verdict === "allow", "attrs and parents must compose: " + JSON.stringify(d));
+  } finally {
+    auth.free();
+  }
+});
+
+check("a wrong-typed entity attribute fails closed WITH a cause", () => {
+  const policy = `permit(principal, action == Drupe::Action::"Read", resource)
+when { principal.id == "alice" };`;
+  const auth = new dw.DogwoodAuthorizer(policy, SCHEMA);
+  try {
+    // `id` is declared String; supply an Int.
+    const d = auth.isAuthorized(event(1, {
+      entities: [{ type: "Drupe::OAuthUser", id: "alice", attrs: { id: 42 } }],
+    }));
+    assert(d.verdict === "deny", "must not allow on a schema violation");
+    assert(
+      d.errors.length > 0,
+      "a fail-closed deny must carry its cause, else it looks like policy-said-no",
+    );
+  } finally {
+    auth.free();
+  }
+});
+
+// ═══ 9. lifecycle ════════════════════════════════════════════════════
+console.log("\nlifecycle");
+
+check("Symbol.dispose frees the instance (explicit resource management)", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  assert(typeof auth[Symbol.dispose] === "function", "the class implements Symbol.dispose");
+  auth[Symbol.dispose]();
+  throws(() => auth.isAuthorized(event(1)), "disposed instance must be unusable");
+});
+
+check("reset re-lowers and preserves the override arguments", () => {
+  // If reset dropped the providers argument, the provider would become
+  // unresolvable and the verdict would flip to a deny-with-errors.
+  const auth = new dw.DogwoodAuthorizer(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_INLINE);
+  try {
+    const before = auth.isAuthorized(event(0, {
+      logged: { input: { document: "ABC" } }, context: { input: { document: "ABC" } },
+    }));
+    assert(before.verdict === "allow", "precondition");
+    auth.reset();
+    const after = auth.isAuthorized(event(1, {
+      logged: { input: { document: "ABC" } }, context: { input: { document: "ABC" } },
+    }));
+    assert(
+      after.verdict === "allow",
+      "the providers override must survive reset, got " + JSON.stringify(after),
+    );
+    assert(after.index === 0, "index restarts");
+  } finally {
+    auth.free();
+  }
+});
+
+check("many instances can coexist with independent histories", () => {
+  const TEMPORAL = `permit(principal, action == Drupe::Action::"Read", resource)
+when temporal { formerly within 1h Drupe::Action::"Read"::response{} };`;
+  const a = new dw.DogwoodAuthorizer(TEMPORAL, SCHEMA);
+  const b = new dw.DogwoodAuthorizer(TEMPORAL, SCHEMA);
+  try {
+    // Record a response in `a` only; `b` must be unaffected.
+    a.isAuthorized(event(1000, { kind: "response", logged: { input: { document: "d" }, output: { content: "c" } }, context: { input: { document: "d" }, output: { content: "c" } } }));
+    assert(a.isAuthorized(event(1010)).verdict === "allow", "a has history");
+    assert(b.isAuthorized(event(1010)).verdict === "deny", "b's history is separate");
+  } finally {
+    a.free();
+    b.free();
+  }
+});
+
+check("timestamps are seconds, and the ordering contract is NOT enforced", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    assert(auth.isAuthorized(event(500)).timestamp === 500, "echoed");
+    // Documented as "must be non-decreasing"; violating it is silently accepted
+    // rather than rejected, so a host cannot rely on being told.
+    const back = auth.isAuthorized(event(100));
+    assert(back !== undefined, "a decreasing timestamp is accepted without complaint");
+    assert(back.timestamp === 100, "and echoed as given");
+  } finally {
+    auth.free();
+  }
+});
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
