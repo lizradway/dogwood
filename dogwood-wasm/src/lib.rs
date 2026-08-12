@@ -23,6 +23,7 @@
 mod error;
 pub mod live;
 mod ops;
+pub(crate) mod providers;
 
 use wasm_bindgen::prelude::*;
 
@@ -91,16 +92,26 @@ pub(crate) fn throw(e: OpError) -> JsValue {
 }
 
 /// Build the optional service-schema overrides from three optional strings.
+///
+/// Fallible only because of the `scriptFile` guard (see [`providers`]): supplied
+/// provider text is parsed here purely to reject a declaration that cannot work
+/// in wasm, and then parsed again by [`ops::SchemaInputs`], which is verbatim
+/// from `dogwood-cli` and so cannot carry the check itself. Two parses of a small
+/// JSON document, only when providers are supplied at all, is the right price for
+/// keeping `ops` a byte-for-byte copy.
 fn inputs<'a>(
     event_schema: Option<&'a str>,
     providers: Option<&'a str>,
     macros: Option<&'a str>,
-) -> SchemaInputs<'a> {
-    SchemaInputs {
+) -> Result<SchemaInputs<'a>, OpError> {
+    if let Some(json) = providers {
+        crate::providers::parse_declarations(json)?;
+    }
+    Ok(SchemaInputs {
         event_schema,
         providers,
         macros,
-    }
+    })
 }
 
 // ─── exported operations ────────────────────────────────────────────────
@@ -114,7 +125,8 @@ pub fn check_parse(
     providers: Option<String>,
     macros: Option<String>,
 ) -> Result<CheckParseReport, JsValue> {
-    let schema = inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref());
+    let schema =
+        inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref()).map_err(throw)?;
     ops::check_parse(source, &schema).map_err(throw)
 }
 
@@ -128,7 +140,8 @@ pub fn validate(
     providers: Option<String>,
     macros: Option<String>,
 ) -> Result<ValidateReport, JsValue> {
-    let schema = inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref());
+    let schema =
+        inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref()).map_err(throw)?;
     ops::validate_policies(source, &schema, action_schema).map_err(throw)
 }
 
@@ -142,7 +155,8 @@ pub fn lower(
     providers: Option<String>,
     macros: Option<String>,
 ) -> Result<LowerArtifacts, JsValue> {
-    let schema = inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref());
+    let schema =
+        inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref()).map_err(throw)?;
     ops::lower_to_cedar(source, &schema, action_schema).map_err(throw)
 }
 
@@ -157,7 +171,8 @@ pub fn replay(
     providers: Option<String>,
     macros: Option<String>,
 ) -> Result<ReplayReport, JsValue> {
-    let schema = inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref());
+    let schema =
+        inputs(event_schema.as_deref(), providers.as_deref(), macros.as_deref()).map_err(throw)?;
     ops::replay_trace(source, &schema, action_schema, log).map_err(throw)
 }
 
@@ -177,6 +192,9 @@ pub fn check_event_schema(source: &str) -> Result<SchemaCheckReport, JsValue> {
 /// isolation.
 #[wasm_bindgen(js_name = checkProviders)]
 pub fn check_providers(json: &str) -> Result<SchemaCheckReport, JsValue> {
+    // The `scriptFile` guard runs first, so a declaration that is well-formed but
+    // unusable here throws rather than reporting `ok: true` — see `providers`.
+    providers::parse_declarations(json).map_err(throw)?;
     ops::check_providers(json).map_err(throw)
 }
 

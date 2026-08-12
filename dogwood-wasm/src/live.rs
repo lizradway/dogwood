@@ -49,7 +49,11 @@
 
 use std::collections::BTreeMap;
 
-use dogwood_language::{Authorizer, Decision, Event, EventBuilder, Value};
+use std::collections::BTreeSet;
+
+use dogwood_language::{
+    Authorizer, Decision, Event, EventBuilder, LoweredPolicySet, Value,
+};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -126,22 +130,22 @@ pub struct EventInput {
     /// is not supported (Cedar permits it; Dogwood's own `Event::builder` has
     /// the same restriction).
     ///
-    /// A *bare* id (`"Read"`) parses but does not resolve to the namespaced
-    /// action a policy names, and the mismatch is **silent**: the decision comes
-    /// back `deny` with an empty
-    /// [`errors`](AuthorizerDecision::errors), indistinguishable from "policy
-    /// said no". Always qualify.
+    /// Must name an action the schema declares — see
+    /// [`actions`](DogwoodAuthorizer::actions). A *bare* id (`"Read"`) would
+    /// otherwise parse and then not resolve, denying with an empty
+    /// [`errors`](AuthorizerDecision::errors) and so being indistinguishable
+    /// from "policy said no"; it is rejected instead, with the qualified id
+    /// suggested.
     pub action: String,
     /// The event kind. `"request"` (the default) is a decision point;
     /// `"response"` / `"error"` are history-only — they update temporal state
-    /// and return `undefined`. Which kinds decide is set by the event schema.
+    /// and return `undefined`. Which kinds exist, and which decide, is set by
+    /// the event schema — see [`eventKinds`](DogwoodAuthorizer::event_kinds) and
+    /// [`decisionKinds`](DogwoodAuthorizer::decision_kinds).
     ///
-    /// A kind the event schema does not declare at all is **not an error**: it
-    /// is treated as history-only and returns `undefined`. So a typo
-    /// (`"requst"`) silently yields no decision forever rather than failing
-    /// loudly — check against
-    /// [`decisionKinds`](DogwoodAuthorizer::decision_kinds) if the kind comes
-    /// from anywhere untrusted.
+    /// A kind the schema does not declare is **rejected**. Left to the engine it
+    /// would be treated as history-only, so a typo (`"requst"`) would silently
+    /// yield no decision forever instead of failing loudly.
     #[serde(default = "default_kind")]
     #[tsify(optional)]
     pub kind: String,
@@ -152,7 +156,10 @@ pub struct EventInput {
     /// predicate would match only events from the last 3.6 seconds.
     ///
     /// Timestamps order events for the temporal operators, so this must be
-    /// **non-decreasing** across calls on one instance.
+    /// **non-decreasing** across calls on one instance — one instance is one
+    /// ordered history. A timestamp before the previous event's is rejected
+    /// rather than silently producing wrong temporal answers; see
+    /// [`lastTimestamp`](DogwoodAuthorizer::last_timestamp).
     #[serde(default)]
     #[tsify(optional)]
     pub timestamp: i64,
@@ -329,6 +336,67 @@ fn build_event(input: &EventInput) -> Result<Event, String> {
     Ok(builder.build())
 }
 
+// ─── the event surface an instance accepts ───────────────────────────
+
+/// The `(action, kind)` surface a lowered policy set derives — what an inbound
+/// event is checked against.
+///
+/// Both halves are silent when got wrong: an action id that does not resolve and
+/// a kind the schema never declared each produce a plain `deny` / `undefined`
+/// rather than a complaint. Capturing the surface at lowering time lets
+/// [`DogwoodAuthorizer::is_authorized`] reject them up front instead.
+struct EventSurface {
+    /// Every **fully qualified** action id (`"Drupe::Action::Read"`).
+    actions: BTreeSet<String>,
+    /// Every declared event kind, decision points and history-only alike.
+    kinds: BTreeSet<String>,
+    /// The subset of [`kinds`](Self::kinds) that are decision points, in the
+    /// schema's own order.
+    decision_kinds: Vec<String>,
+}
+
+impl EventSurface {
+    /// Read the surface off a lowered set. `event_signatures` yields one entry
+    /// per derived `(action, kind)`; the qualified id is the signature's
+    /// namespace (which already carries the trailing `Action` segment) joined
+    /// onto its action id.
+    fn of(lowered: &LoweredPolicySet) -> EventSurface {
+        let mut actions = BTreeSet::new();
+        let mut kinds = BTreeSet::new();
+        for sig in lowered.event_signatures() {
+            let mut qualified = String::new();
+            for segment in sig.namespace() {
+                qualified.push_str(segment);
+                qualified.push_str("::");
+            }
+            qualified.push_str(sig.action());
+            actions.insert(qualified);
+            kinds.insert(sig.kind().to_string());
+        }
+        EventSurface {
+            actions,
+            kinds,
+            decision_kinds: lowered.decision_kinds().map(str::to_string).collect(),
+        }
+    }
+}
+
+/// Render a set for an error message, capped so a schema with a hundred actions
+/// does not produce a hundred-line error.
+fn listing(items: &BTreeSet<String>) -> String {
+    const CAP: usize = 8;
+    let shown = items
+        .iter()
+        .take(CAP)
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match items.len().checked_sub(CAP) {
+        Some(rest) if rest > 0 => format!("{shown} (and {rest} more)"),
+        _ => shown,
+    }
+}
+
 // ─── the exported class ──────────────────────────────────────────────
 
 /// A **stateful, live** Dogwood authorizer: lower a policy set once, then feed
@@ -353,10 +421,13 @@ pub struct DogwoodAuthorizer {
     /// Decision counter — the `index` of the next decision. History-only
     /// events do not advance it.
     decisions: usize,
-    /// The event kinds that are decision points, captured at lowering time.
-    /// Exposed so a host can tell a history-only kind from a typo, which
-    /// `is_authorized` cannot: both return `undefined`.
-    decision_kinds: Vec<String>,
+    /// The `(action, kind)` surface this instance accepts, captured at lowering
+    /// time so inbound events can be checked against it.
+    surface: EventSurface,
+    /// The timestamp of the most recent event observed, or `None` before the
+    /// first. Kept to enforce the non-decreasing-timestamp contract, which the
+    /// temporal operators depend on and the engine does not check.
+    last_timestamp: Option<i64>,
 }
 
 #[wasm_bindgen]
@@ -377,15 +448,21 @@ impl DogwoodAuthorizer {
         providers: Option<String>,
         macros: Option<String>,
     ) -> Result<DogwoodAuthorizer, JsValue> {
+        // Reject provider declarations that cannot work in wasm before lowering,
+        // so an unresolvable `scriptFile` is a construction-time error rather
+        // than a fail-closed deny on every later decision.
+        if let Some(json) = providers.as_deref() {
+            crate::providers::parse_declarations(json).map_err(crate::throw)?;
+        }
         let inputs = SchemaInputs {
             event_schema: event_schema.as_deref(),
             providers: providers.as_deref(),
             macros: macros.as_deref(),
         };
         let lowered = lower_for_authorizer(source, &inputs, action_schema).map_err(crate::throw)?;
-        // Captured before the lowered set is moved into the authorizer, which
+        // Read off before the lowered set is moved into the authorizer, which
         // consumes it.
-        let decision_kinds = lowered.decision_kinds().map(str::to_string).collect();
+        let surface = EventSurface::of(&lowered);
         Ok(DogwoodAuthorizer {
             authorizer: Authorizer::new(lowered),
             source: source.to_string(),
@@ -394,8 +471,64 @@ impl DogwoodAuthorizer {
             providers,
             macros,
             decisions: 0,
-            decision_kinds,
+            surface,
+            last_timestamp: None,
         })
+    }
+
+    /// Check an inbound event against what this instance can actually decide:
+    /// its action and kind must be ones the schema derives, and its timestamp
+    /// must not go backwards.
+    ///
+    /// All three are checked **before** the event is observed, so a rejected
+    /// event leaves the temporal history untouched — a failed call is a no-op,
+    /// not a partial one.
+    fn check(&self, event: &EventInput) -> Result<(), String> {
+        if !self.surface.actions.contains(&event.action) {
+            // An id whose last segment matches exactly one known action is
+            // almost always a missing namespace — the bare-`"Read"` mistake.
+            let tail = event.action.rsplit("::").next().unwrap_or(&event.action);
+            let mut same_tail = self
+                .surface
+                .actions
+                .iter()
+                .filter(|known| known.rsplit("::").next() == Some(tail));
+            let hint = match (same_tail.next(), same_tail.next()) {
+                (Some(only), None) => format!(" — did you mean `{only}`?"),
+                _ => String::new(),
+            };
+            return Err(format!(
+                "unknown action `{}`: not declared by the action schema, which declares {}. \
+                 Action ids are fully qualified, `Ns::Action::Id`{}",
+                event.action,
+                listing(&self.surface.actions),
+                hint,
+            ));
+        }
+
+        if !self.surface.kinds.contains(&event.kind) {
+            return Err(format!(
+                "unknown event kind `{}`. The event schema declares {} — of which {} \
+                 {} a decision point",
+                event.kind,
+                listing(&self.surface.kinds),
+                listing(&self.surface.decision_kinds.iter().cloned().collect()),
+                if self.surface.decision_kinds.len() == 1 { "is" } else { "are" },
+            ));
+        }
+
+        if self.last_timestamp.is_some_and(|last| event.timestamp < last) {
+            let last = self.last_timestamp.unwrap_or_default();
+            return Err(format!(
+                "event timestamp {} is before the previous event's {}. Timestamps order \
+                 events for the temporal operators, so they must be non-decreasing across \
+                 calls on one authorizer — one instance is one ordered history. Feed events \
+                 in order, or use a separate instance (or `reset()`) per history.",
+                event.timestamp, last,
+            ));
+        }
+
+        Ok(())
     }
 
     /// Authorize one event.
@@ -405,10 +538,15 @@ impl DogwoodAuthorizer {
     /// which still updates temporal history, and is how a host records the
     /// `response` half of a call so later policies can correlate against it.
     ///
-    /// Throws a `DogwoodError` if the event itself is malformed (a missing
-    /// `action`, a bad `__entity` tag, a wrong-typed field). Such a throw leaves
-    /// the instance **usable** — the next call decides normally. A *policy*
-    /// problem is never thrown: an evaluation failure comes back as a
+    /// Throws a `DogwoodError` if the event is malformed (a missing `action`, a
+    /// bad `__entity` tag, a wrong-typed field) or **rejected** by
+    /// [`check`](Self::check) — an action or kind the schema does not declare, or
+    /// a timestamp before the previous event's. Either way the instance is left
+    /// **usable** and the temporal history untouched: the event is validated
+    /// before it is observed, so a failed call is a no-op and the next call
+    /// decides normally.
+    ///
+    /// A *policy* problem is never thrown: an evaluation failure comes back as a
     /// fail-closed `deny` with the cause in
     /// [`errors`](AuthorizerDecision::errors).
     ///
@@ -428,7 +566,14 @@ impl DogwoodAuthorizer {
     ) -> Result<Option<AuthorizerDecision>, JsValue> {
         let event: EventInput = serde_wasm_bindgen::from_value(event)
             .map_err(|e| crate::throw(OpError::message(format!("invalid event: {e}"))))?;
+        self.check(&event)
+            .map_err(|e| crate::throw(OpError::message(e)))?;
         let built = build_event(&event).map_err(|e| crate::throw(OpError::message(e)))?;
+
+        // Every rejection is behind us, so the event is definitely about to be
+        // observed; record its timestamp for the ordering check on the next call.
+        // History-only events count — they enter the same ordered history.
+        self.last_timestamp = Some(event.timestamp);
 
         // `None` is a history-only event: temporal state advanced, no verdict.
         let Some(response) = self.authorizer.is_authorized(&built) else {
@@ -467,9 +612,12 @@ impl DogwoodAuthorizer {
         };
         let lowered = lower_for_authorizer(&self.source, &inputs, &self.action_schema)
             .map_err(crate::throw)?;
-        self.decision_kinds = lowered.decision_kinds().map(str::to_string).collect();
+        self.surface = EventSurface::of(&lowered);
         self.authorizer = Authorizer::new(lowered);
         self.decisions = 0;
+        // A fresh history is a fresh ordering: the next event may carry any
+        // timestamp, including one before the last event of the old history.
+        self.last_timestamp = None;
         Ok(())
     }
 
@@ -481,14 +629,49 @@ impl DogwoodAuthorizer {
     }
 
     /// The event kinds that are decision points under this instance's event
-    /// schema (`["request"]` by default).
+    /// schema (`["request"]` by default) — the kinds for which
+    /// [`isAuthorized`](Self::is_authorized) returns a decision rather than
+    /// `undefined`.
     ///
-    /// [`isAuthorized`](Self::is_authorized) returns `undefined` both for a
-    /// legitimately history-only kind and for a kind the schema never declared,
-    /// so a typo is otherwise indistinguishable from a `response`. Checking
-    /// membership here turns that silent no-op into a detectable one.
+    /// A kind in [`eventKinds`](Self::event_kinds) but not here is history-only:
+    /// it is accepted, it updates temporal state, and it yields no verdict.
     #[wasm_bindgen(getter, js_name = decisionKinds)]
     pub fn decision_kinds(&self) -> Vec<String> {
-        self.decision_kinds.clone()
+        self.surface.decision_kinds.clone()
+    }
+
+    /// Every event kind this instance's event schema declares, decision points
+    /// and history-only alike (`["error", "request", "response"]` by default).
+    /// Any other kind is rejected — see [`isAuthorized`](Self::is_authorized).
+    #[wasm_bindgen(getter, js_name = eventKinds)]
+    pub fn event_kinds(&self) -> Vec<String> {
+        self.surface.kinds.iter().cloned().collect()
+    }
+
+    /// Every **fully qualified** action id this instance can decide
+    /// (`["Drupe::Action::Read", …]`) — the actions the action schema declares.
+    /// An event naming anything else is rejected, so a host that maps its own
+    /// operation names onto Cedar actions can check the mapping against this
+    /// once at startup rather than discovering a gap one denied request at a
+    /// time.
+    #[wasm_bindgen(getter)]
+    pub fn actions(&self) -> Vec<String> {
+        self.surface.actions.iter().cloned().collect()
+    }
+
+    /// The timestamp of the most recent event observed, or `undefined` before
+    /// the first (and after a [`reset`](Self::reset)). The next event's
+    /// timestamp must be at least this.
+    ///
+    /// Widened to `f64` so the TypeScript type is `number`, matching
+    /// [`AuthorizerDecision::timestamp`] and the `timestamp` a host passes in.
+    /// An `i64` would come back a `BigInt`, which compares false against every
+    /// plain number it is likely to be compared with (`5n == 5` is true but
+    /// `5n === 5` is false, and mixed arithmetic throws) — a needless trap on a
+    /// value that is a count of seconds and so nowhere near `f64`'s exact-integer
+    /// limit.
+    #[wasm_bindgen(getter, js_name = lastTimestamp)]
+    pub fn last_timestamp(&self) -> Option<f64> {
+        self.last_timestamp.map(|t| t as f64)
     }
 }

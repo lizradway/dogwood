@@ -115,14 +115,29 @@ if (noDecision === undefined) console.log("history-only event: no verdict");
 
 const _count: number = auth.decisionCount;
 
-// `isAuthorized` returns undefined both for a legitimately history-only kind and
-// for a kind the event schema never declared, so a typo yields no decision
-// rather than an error. When the kind comes from anywhere untrusted, check it.
-const kinds: string[] = auth.decisionKinds;
-function isDecisionPoint(kind: string): boolean {
-  return kinds.includes(kind);
+// An event naming an action or kind the schema does not declare, or carrying a
+// timestamp before the previous event's, is rejected rather than silently
+// mis-answered. These getters describe what this instance will accept, so a host
+// can check its own wiring once at startup instead of per request.
+const actions: string[] = auth.actions; // every action the schema declares
+const kinds: string[] = auth.eventKinds; // every declared kind
+const deciding: string[] = auth.decisionKinds; // the subset that yields a verdict
+// undefined until the first event; afterwards the ordering watermark, as a
+// `number` (not a BigInt) so it compares with a decision's `timestamp`.
+const watermark: number | undefined = auth.lastTimestamp;
+
+/** A kind that is declared but does not decide is history-only. */
+function isHistoryOnly(kind: string): boolean {
+  return kinds.includes(kind) && !deciding.includes(kind);
 }
-console.log(isDecisionPoint("request"), isDecisionPoint("requst"));
+console.log(actions.length, isHistoryOnly("response"), watermark);
+
+// A rejection is a DogwoodError, and leaves the instance usable.
+try {
+  auth.isAuthorized({ ...request, action: "Read" }); // unqualified
+} catch (e) {
+  console.error((e as DogwoodError).message); // "…did you mean `Drupe::Action::Read`?"
+}
 
 auth.reset(); // drop accumulated history, re-lower the same sources
 

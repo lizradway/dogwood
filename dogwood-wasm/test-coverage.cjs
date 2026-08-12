@@ -445,24 +445,51 @@ check("checkProviders throws on JSON that is not a declarations file", () => {
   throws(() => dw.checkProviders(`{"availableProviders": {"Bad::P": {"nonsense": 1}}}`));
 });
 
-// A false green worth pinning: the check passes, but the provider can never run
-// here. Documented in the README; asserted so the behaviour cannot drift
-// unnoticed into a silent wrong answer.
-check("a scriptFile provider passes checkProviders but fails CLOSED at authorize time", () => {
-  assert(
-    dw.checkProviders(PROVIDERS_SCRIPTFILE).ok === true,
-    "checkProviders cannot see that the script is unresolved",
+// A `scriptFile` reference is structurally valid but unresolvable in wasm (no
+// filesystem), so left alone it is a false green: the check reports ok, then the
+// provider fails closed on every decision. Rejected up front instead — the whole
+// point is that this is caught at check time, not discovered as a mystery deny.
+check("checkProviders REJECTS a scriptFile provider (unresolvable in wasm)", () => {
+  const e = throws(
+    () => dw.checkProviders(PROVIDERS_SCRIPTFILE),
+    "a providers file that cannot work here must not report ok",
   );
-  const r = dw.replay(GUARDRAIL_POLICY, SCHEMA, traceLine(0, "ABC"), undefined, PROVIDERS_SCRIPTFILE);
-  assert(r.verdicts[0].verdict === "deny", "must fail closed, not allow");
+  assert(e.name === "DogwoodError", "name, got " + e.name);
+  assert(/scriptFile|matches\.rhai/.test(e.message), "names the file, got " + e.message);
+  assert(/implementation\.script|inline/i.test(e.message), "says how to fix it, got " + e.message);
+  assert(e.message.includes("Strings::Matches"), "names the provider, got " + e.message);
+});
+
+// The same guard on every entry point that accepts provider text — otherwise the
+// check would reject it and the operation would accept it, which is worse than
+// either alone.
+check("every providers-taking operation rejects a scriptFile provider", () => {
+  const ops = {
+    checkProviders: () => dw.checkProviders(PROVIDERS_SCRIPTFILE),
+    checkParse: () => dw.checkParse(GUARDRAIL_POLICY, undefined, PROVIDERS_SCRIPTFILE),
+    validate: () => dw.validate(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_SCRIPTFILE),
+    lower: () => dw.lower(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_SCRIPTFILE),
+    replay: () =>
+      dw.replay(GUARDRAIL_POLICY, SCHEMA, traceLine(0, "ABC"), undefined, PROVIDERS_SCRIPTFILE),
+    "new DogwoodAuthorizer": () =>
+      new dw.DogwoodAuthorizer(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_SCRIPTFILE),
+  };
+  for (const [name, fn] of Object.entries(ops)) {
+    const e = throws(fn, `${name} accepted an unresolvable scriptFile`);
+    assert(/scriptFile/.test(e.message), `${name} threw for the wrong reason: ${e.message}`);
+  }
+  // ...and the inline form still works through all of them, so the guard is
+  // rejecting the unresolvable case rather than providers in general.
+  assert(dw.checkProviders(PROVIDERS_INLINE).ok === true, "inline providers still pass");
   assert(
-    r.verdicts[0].errors.length > 0,
-    "and must say why — a silent deny would be indistinguishable from policy-said-no",
+    dw.validate(GUARDRAIL_POLICY, SCHEMA, undefined, PROVIDERS_INLINE).passed === true,
+    "inline providers still validate",
   );
-  assert(
-    /scriptFile|no script/.test(r.verdicts[0].errors[0]),
-    "the cause names the unresolved script, got " + r.verdicts[0].errors[0],
-  );
+});
+
+check("a `rhai` implementation with neither script nor scriptFile is rejected", () => {
+  const e = throws(() => dw.checkProviders(providersJson({ kind: "rhai" })));
+  assert(/no script|neither/.test(e.message), "explains what is missing, got " + e.message);
 });
 
 // ═══ 6. mcpToCedarSchema ═════════════════════════════════════════════
@@ -537,57 +564,178 @@ check("a custom event schema changes which kinds decide", () => {
       auth.isAuthorized(event(110, { kind: "outcome" })) === undefined,
       "`outcome` is history-only",
     );
-    assert(
-      auth.isAuthorized(event(120, { kind: "request" })) === undefined,
-      "`request` does NOT decide under this schema",
+    // This schema does not declare `request` at all, so the default kind — which
+    // decides under the default schema — is now rejected outright. An ignored
+    // eventSchema argument would make this call succeed instead.
+    const e = throws(
+      () => auth.isAuthorized(event(120, { kind: "request" })),
+      "`request` is not a kind under this schema",
     );
+    assert(/attempt/.test(e.message), "the message lists this schema's kinds, got " + e.message);
   } finally {
     auth.free();
   }
 });
 
-check("decisionKinds defaults to [request] and survives reset", () => {
+check("the kind getters default correctly and survive reset", () => {
   const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
   try {
-    assert(JSON.stringify(auth.decisionKinds) === JSON.stringify(["request"]), "default");
-    auth.reset();
-    assert(JSON.stringify(auth.decisionKinds) === JSON.stringify(["request"]), "after reset");
+    for (const when of ["initially", "after reset"]) {
+      assert(
+        JSON.stringify(auth.decisionKinds) === JSON.stringify(["request"]),
+        `decisionKinds ${when}, got ` + JSON.stringify(auth.decisionKinds),
+      );
+      // Every declared kind, not just the deciding ones — the two getters
+      // together are what distinguish "history-only" from "not a kind at all".
+      assert(
+        JSON.stringify(auth.eventKinds) === JSON.stringify(["error", "request", "response"]),
+        `eventKinds ${when}, got ` + JSON.stringify(auth.eventKinds),
+      );
+      auth.reset();
+    }
   } finally {
     auth.free();
   }
 });
 
-// A silent failure mode, pinned so it stays documented rather than surprising:
-// an undeclared kind is treated as history-only, NOT rejected.
-check("an unrecognized kind is a silent no-op (detectable only via decisionKinds)", () => {
-  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+check("eventKinds tracks a custom event schema, and both getters stay consistent", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA, CUSTOM_KINDS);
   try {
-    const d = auth.isAuthorized(event(100, { kind: "requst" })); // typo
-    assert(d === undefined, "a typo'd kind yields no decision rather than throwing");
-    assert(auth.decisionCount === 0, "and no decision is counted");
-    // This is the check a host must make for itself.
     assert(
-      !auth.decisionKinds.includes("requst"),
-      "decisionKinds is what makes the typo detectable",
+      JSON.stringify(auth.eventKinds) === JSON.stringify(["attempt", "outcome"]),
+      "eventKinds, got " + JSON.stringify(auth.eventKinds),
     );
+    // decisionKinds must always be a subset of eventKinds; a kind in the
+    // difference is history-only.
+    assert(
+      auth.decisionKinds.every((k) => auth.eventKinds.includes(k)),
+      "decisionKinds must be a subset of eventKinds",
+    );
+    assert(!auth.eventKinds.includes("request"), "`request` is not declared by this schema");
   } finally {
     auth.free();
   }
 });
 
-// Another silent failure mode: an unqualified action id denies with no errors.
-check("a bare (unqualified) action id denies silently — always qualify", () => {
+// Formerly a silent no-op: an undeclared kind was treated as history-only, so a
+// typo returned `undefined` forever and nothing was ever authorized. Rejected now.
+check("an unrecognized kind is REJECTED, not treated as history-only", () => {
   const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
   try {
-    const qualified = auth.isAuthorized(event(100));
-    const bare = auth.isAuthorized(event(110, { action: "Read" }));
-    assert(qualified.verdict === "allow", "the qualified id allows");
-    assert(bare.verdict === "deny", "the bare id denies, got " + bare.verdict);
-    assert(
-      bare.errors.length === 0,
-      "and carries NO errors — indistinguishable from policy-said-no, which is " +
-        "why the docs require a qualified id",
+    const e = throws(
+      () => auth.isAuthorized(event(100, { kind: "requst" })), // typo
+      "a kind the schema never declared must not be silently accepted",
     );
+    assert(e.name === "DogwoodError", "name, got " + e.name);
+    assert(e.message.includes("requst"), "quotes the bad kind, got " + e.message);
+    assert(/request/.test(e.message), "lists the declared kinds, got " + e.message);
+    assert(/decision point/.test(e.message), "says which decide, got " + e.message);
+    // A genuinely history-only kind is still accepted and still yields no
+    // verdict — the rejection must not have swept that case up with it.
+    assert(auth.isAuthorized(event(110, { kind: "response" })) === undefined, "response is fine");
+    assert(auth.decisionCount === 0, "neither call counted as a decision");
+    // The rejected event must not have entered history at all.
+    assert(auth.lastTimestamp === 110, "the rejected event left no trace, got " + auth.lastTimestamp);
+  } finally {
+    auth.free();
+  }
+});
+
+// Formerly the worst of the silent modes: an unqualified id denied with an EMPTY
+// `errors`, indistinguishable from "policy said no".
+check("a bare (unqualified) action id is REJECTED, with the qualified id suggested", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    assert(auth.isAuthorized(event(100)).verdict === "allow", "the qualified id allows");
+    const e = throws(
+      () => auth.isAuthorized(event(110, { action: "Read" })),
+      "a bare id must not silently deny",
+    );
+    assert(e.name === "DogwoodError", "name, got " + e.name);
+    assert(
+      e.message.includes('did you mean `Drupe::Action::Read`'),
+      "the unique tail match is suggested, got " + e.message,
+    );
+    // An action that is not a suffix of any known one gets no bogus suggestion.
+    const f = throws(() => auth.isAuthorized(event(120, { action: "Drupe::Action::Delete" })));
+    assert(!/did you mean/.test(f.message), "no spurious suggestion, got " + f.message);
+    assert(
+      f.message.includes("Drupe::Action::Read"),
+      "but the known actions are still listed, got " + f.message,
+    );
+    // The instance is unharmed by either rejection.
+    assert(auth.isAuthorized(event(130)).verdict === "allow", "still decides afterwards");
+    assert(auth.decisionCount === 2, "only the two real decisions counted");
+  } finally {
+    auth.free();
+  }
+});
+
+// `actions` comes from the ACTION SCHEMA, not from the policy set. That is what
+// makes rejecting an unknown action safe: an action no policy mentions is still
+// a legal event, and must still get a (deny) decision rather than a throw.
+check("actions lists every schema action, including ones no policy names", () => {
+  const TWO_ACTIONS = `namespace Drupe {
+  entity Gateway;
+  entity OAuthUser = { id: String } tags String;
+  type ReadInput = { document: String };
+  type ReadOutput = { content: String };
+  action "Read" appliesTo {
+    principal: [OAuthUser], resource: [Gateway],
+    context: { input: ReadInput, output: ReadOutput }
+  };
+  action "Write" appliesTo {
+    principal: [OAuthUser], resource: [Gateway],
+    context: { input: ReadInput, output: ReadOutput }
+  };
+}`;
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, TWO_ACTIONS);
+  try {
+    assert(
+      JSON.stringify(auth.actions) ===
+        JSON.stringify(["Drupe::Action::Read", "Drupe::Action::Write"]),
+      "both actions listed, got " + JSON.stringify(auth.actions),
+    );
+    const unpoliced = auth.isAuthorized(event(100, { action: "Drupe::Action::Write" }));
+    assert(unpoliced !== undefined, "an unpoliced action still gets a decision, not a throw");
+    assert(unpoliced.verdict === "deny", "and it denies, got " + unpoliced.verdict);
+    assert(unpoliced.errors.length === 0, "an implicit deny carries no errors");
+  } finally {
+    auth.free();
+  }
+});
+
+// A schema with no namespace derives `Action::Read`. Pinned because the guard
+// builds the qualified id itself, and getting that wrong would reject every
+// event under an unnamespaced schema — a false rejection, the failure mode a
+// validity check must not have.
+check("a namespace-less action schema is not falsely rejected", () => {
+  const BARE_SCHEMA = `entity Gateway;
+entity OAuthUser = { id: String } tags String;
+type ReadInput = { document: String };
+type ReadOutput = { content: String };
+action "Read" appliesTo {
+  principal: [OAuthUser], resource: [Gateway],
+  context: { input: ReadInput, output: ReadOutput }
+};`;
+  const auth = new dw.DogwoodAuthorizer(
+    `permit(principal, action == Action::"Read", resource);`,
+    BARE_SCHEMA,
+  );
+  try {
+    assert(
+      JSON.stringify(auth.actions) === JSON.stringify(["Action::Read"]),
+      "qualified id, got " + JSON.stringify(auth.actions),
+    );
+    const d = auth.isAuthorized({
+      action: "Action::Read",
+      timestamp: 1,
+      principal: { type: "OAuthUser", id: "alice" },
+      resource: { type: "Gateway", id: "gw1" },
+      logged: { input: { document: "d" } },
+      context: { input: { document: "d" } },
+    });
+    assert(d !== undefined && d.verdict === "allow", "decides, got " + JSON.stringify(d));
   } finally {
     auth.free();
   }
@@ -867,15 +1015,56 @@ when temporal { formerly within 1h Drupe::Action::"Read"::response{} };`;
   }
 });
 
-check("timestamps are seconds, and the ordering contract is NOT enforced", () => {
+// The ordering contract is what the temporal operators rest on, so violating it
+// does not fail — it quietly produces wrong answers. Enforced, and the boundary
+// (equal is fine, earlier is not) pinned in both directions.
+check("the non-decreasing-timestamp contract is enforced", () => {
   const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
   try {
+    assert(auth.lastTimestamp === undefined, "undefined before the first event");
     assert(auth.isAuthorized(event(500)).timestamp === 500, "echoed");
-    // Documented as "must be non-decreasing"; violating it is silently accepted
-    // rather than rejected, so a host cannot rely on being told.
-    const back = auth.isAuthorized(event(100));
-    assert(back !== undefined, "a decreasing timestamp is accepted without complaint");
-    assert(back.timestamp === 100, "and echoed as given");
+    assert(auth.lastTimestamp === 500, "lastTimestamp tracks it, got " + auth.lastTimestamp);
+    // Equal is non-decreasing, so it is allowed: two events can share a second.
+    assert(auth.isAuthorized(event(500)) !== undefined, "an equal timestamp is accepted");
+    const e = throws(() => auth.isAuthorized(event(100)), "an earlier timestamp must be rejected");
+    assert(e.name === "DogwoodError", "name, got " + e.name);
+    assert(/100/.test(e.message) && /500/.test(e.message), "names both, got " + e.message);
+    // Rejected, so not observed: the watermark has not moved.
+    assert(auth.lastTimestamp === 500, "watermark unmoved, got " + auth.lastTimestamp);
+    assert(auth.isAuthorized(event(600)) !== undefined, "and a later event still works");
+    // A history-only event advances the watermark too — it enters the same history.
+    auth.isAuthorized(event(700, { kind: "response", logged: { input: { document: "d" }, output: { content: "c" } }, context: { input: { document: "d" }, output: { content: "c" } } }));
+    assert(auth.lastTimestamp === 700, "history-only events count, got " + auth.lastTimestamp);
+    throws(() => auth.isAuthorized(event(650)), "and are ordered against too");
+  } finally {
+    auth.free();
+  }
+});
+
+check("reset clears the timestamp watermark, so a fresh history may start earlier", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    auth.isAuthorized(event(9000));
+    assert(auth.lastTimestamp === 9000, "watermark set");
+    auth.reset();
+    assert(auth.lastTimestamp === undefined, "cleared by reset, got " + auth.lastTimestamp);
+    // Would throw against the old watermark; a reset history is a new ordering.
+    assert(auth.isAuthorized(event(5)) !== undefined, "an earlier timestamp is fine post-reset");
+  } finally {
+    auth.free();
+  }
+});
+
+// `lastTimestamp` must be a plain number, not a BigInt: an i64 returned raw
+// crosses as BigInt, which is `!==` every number it would be compared against
+// and throws on mixed arithmetic.
+check("lastTimestamp is a number, comparable with a decision's timestamp", () => {
+  const auth = new dw.DogwoodAuthorizer(ALLOW_ALL, SCHEMA);
+  try {
+    const d = auth.isAuthorized(event(1234));
+    assert(typeof auth.lastTimestamp === "number", "got " + typeof auth.lastTimestamp);
+    assert(auth.lastTimestamp === d.timestamp, "strictly equal to the decision's timestamp");
+    assert(auth.lastTimestamp - 34 === 1200, "and usable in arithmetic");
   } finally {
     auth.free();
   }
