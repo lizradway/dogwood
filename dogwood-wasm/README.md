@@ -36,7 +36,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 
 cd dogwood-wasm
-npm run build              # → pkg/ (Node/CommonJS target)
+npm run build                   # → pkg/ (Node/CommonJS target, uses wasm-pack)
 npm install && npm run verify   # runtime tests + tsc --strict typecheck
 ```
 
@@ -61,6 +61,17 @@ The trailing `eventSchema? / providers? / macros?` arguments are optional servic
 
 ```js
 const dw = require("./pkg/dogwood_wasm.js");
+
+const actionSchema = `namespace Drupe {
+  entity User; entity Gateway;
+  action "Read" appliesTo {
+    principal: [User], resource: [Gateway],
+    context: { input: { document: String, user: String } }
+  };
+}`;
+
+const policy = `permit(principal, action == Drupe::Action::"Read", resource)
+when { context.input.document like "*report*" };`;
 
 const report = dw.validate(policy, actionSchema);
 console.log(report.passed); // true
@@ -126,8 +137,10 @@ using auth = new DogwoodAuthorizer(policy, actionSchema);
 Fatal failures throw a `DogwoodError` with structured `.diagnostic`:
 
 ```ts
+import { validate, type DogwoodError } from "./pkg/dogwood_wasm.js";
+
 try {
-  dw.validate("permit(", actionSchema);
+  validate("permit(", actionSchema);
 } catch (e) {
   const err = e as DogwoodError;
   // err.diagnostic: { message, severity, code?, labels[], help?, related? }
